@@ -116,3 +116,4 @@ releases/
 tools/wfdprobe
 tools/rtsptry
 tools/wfdsink
+.memsearch/
