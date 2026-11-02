@@ -20,31 +20,25 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
+      # ubuntu-latest runner 已自带 Android SDK，不需要 setup-android action
+      # （它会尝试安装已废弃的 'tools' 包并失败）
       - name: Install NDK and CMake
         run: |
-          sdkmanager --install "ndk;27.0.12077973" "cmake;3.22.1"
-          echo "NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> $GITHUB_ENV
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.0.12077973" "cmake;3.22.1" "platforms;android-36" "build-tools;35.0.0"
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build Debug APK (ARM32 only)
+      - name: Build Debug APK (ARM32)
         working-directory: MiracastReceiver
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug -PbuildArm32 --stacktrace
+          ./gradlew assembleDebug -PbuildArm32 --no-daemon --stacktrace
 
       - name: Upload ARM32 APK
         uses: actions/upload-artifact@v4
         with:
           name: miracast-debug-arm32
           path: MiracastReceiver/app/build/outputs/apk/debug/*.apk
-          if-no-files-found: warn
-
-      - name: Build Release APK (ARM32, unsigned)
-        if: false   # 需要签名才能安装，默认关闭
-        working-directory: MiracastReceiver
-        run: ./gradlew assembleRelease -PbuildArm32
+          if-no-files-found: error
