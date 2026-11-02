@@ -17,6 +17,10 @@ import timber.log.Timber
  *
  * @param surfaceProvider 取当前可用的 Surface；应用切后台时会返回 null
  */
+/** 重建退避的起点；连续失败时逐次翻倍，直到上限。 */
+private const val INITIAL_REBUILD_BACKOFF_MS = 1_000L
+private const val MAX_REBUILD_BACKOFF_MS = 10_000L
+
 class MiracastVideoRenderer(
     private val surfaceProvider: () -> Surface?,
     /** 重建解码器后向 Source 要一个 IDR，避免干等 2~3 秒的自然 GOP。 */
@@ -32,6 +36,13 @@ class MiracastVideoRenderer(
 
     /** 自上次健康检查以来的不连续次数，用于诊断时区分「偶发抖动」和「链路持续丢包」。 */
     private var discontinuitiesSinceHealthCheck = 0
+
+    // ─── 重建退避 ─────────────────────────────────────────────────────────
+    // 硬解一旦真的坏掉（SPS/PPS 不兼容等），无退避的重建会变成每 800ms 创建销毁一次，
+    // 比冻结更糟：画面上不来还持续消耗 CPU。拿到首帧输出后退避自动归零。
+    private var consecutiveRebuilds = 0
+    private var rebuildBackoffMs = 0L
+    private var lastRebuildAt = 0L
 
     /**
      * 数据有丢失时调用。
@@ -63,6 +74,7 @@ class MiracastVideoRenderer(
     private var statDroppedNoIdr = 0L
     private var statDiscontinuities = 0L
     private var statDecoderStalls = 0L
+    private var statStallsSuppressed = 0L
     /** 累计真正送显的帧数（跨解码器重建累加）—— 这才是「屏幕上有没有动」的证据。 */
     private var statOutputFrames = 0L
     private var statLastDecoderFrames = 0L
@@ -79,11 +91,17 @@ class MiracastVideoRenderer(
             val current = d.outputFrameCount
             if (current >= statLastDecoderFrames) statOutputFrames += current - statLastDecoderFrames
             statLastDecoderFrames = current
+            // 真正出帧了说明解码器是健康的，重建退避归零 —— 下次真出问题时能立刻救。
+            if (current > 0 && consecutiveRebuilds > 0) {
+                consecutiveRebuilds = 0
+                rebuildBackoffMs = 0L
+            }
         }
         Timber.i(
             "Miracast video stats: units=$statUnits decoded=$statDecoded " +
                 "noSurface=$statDroppedNoSurface noConfig=$statDroppedNoConfig " +
                 "noIdr=$statDroppedNoIdr disc=$statDiscontinuities stalls=$statDecoderStalls " +
+                "stallSkip=$statStallsSuppressed backoff=${rebuildBackoffMs}ms " +
                 "out=$statOutputFrames hasSps=${sps != null} hasPps=${pps != null} " +
                 "decoder=${decoder != null} awaitingKeyframe=$awaitingKeyframe"
         )
@@ -113,12 +131,26 @@ class MiracastVideoRenderer(
         // 「多久没出帧」发现。重建后从下一个 IDR 恢复（GOP 约 2~3 秒）。
         val stalled = current?.isStalled() == true
         if (stalled) {
-            Timber.w(
-                "Miracast: decoder stalled (no frame for ${VideoDecoder.STALL_TIMEOUT_MS}ms, " +
-                    "disc=$discontinuitiesSinceHealthCheck since last check) — recreating"
-            )
             if (BuildConfig.DEBUG) statDecoderStalls++
-            releaseDecoder()
+            val sinceLast = System.currentTimeMillis() - lastRebuildAt
+            if (sinceLast < rebuildBackoffMs) {
+                // 退避期内：判定卡死但不重建，避免反复创建/销毁这颗不稳定的硬解。
+                // 硬解实例创建本身要几百毫秒且可能失败，抖动式重建只会让画面更糟。
+                if (BuildConfig.DEBUG) statStallsSuppressed++
+            } else {
+                Timber.w(
+                    "Miracast: decoder stalled (${current.inputsSinceLastOutput} inputs with no output, " +
+                        "disc=$discontinuitiesSinceHealthCheck) — recreating (backoff ${rebuildBackoffMs}ms)"
+                )
+                releaseDecoder()
+                // 重建成功才升级退避；拿到首帧输出后由 onAccessUnit 里的首帧路径清零。
+                consecutiveRebuilds++
+                rebuildBackoffMs = minOf(
+                    INITIAL_REBUILD_BACKOFF_MS shl (consecutiveRebuilds - 1),
+                    MAX_REBUILD_BACKOFF_MS
+                )
+                lastRebuildAt = System.currentTimeMillis()
+            }
         }
         discontinuitiesSinceHealthCheck = 0
 
@@ -157,6 +189,8 @@ class MiracastVideoRenderer(
         decoder = VideoDecoder(surface).also { it.initialize(spsBytes, ppsBytes, width, height) }
         configuredSurface = surface
         statLastDecoderFrames = 0L
+        // 注意：不要在这里清零 consecutiveRebuilds —— 退避只有在「真正解出帧」后才该撤销，
+        // 否则每次重建都会把计数归零，退避形同虚设。
         awaitingKeyframe = true
         Timber.i("Miracast decoder initialized: ${width}x$height")
         // 干等自然 GOP 要 2~3 秒，主动要一个 IDR 通常几百毫秒就到。

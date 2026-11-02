@@ -78,6 +78,26 @@ class VideoDecoder(private val outputSurface: Surface) {
     @Volatile
     private var initializedAt = 0L
 
+    /**
+     * 自上次输出以来成功排入解码器的输入帧数。
+     *
+     * 「喂了数据却没出帧」才是卡死；「没喂数据」只是没人送（Source 暂停、还在等 IDR）
+     * —— 后者绝不能触发重建，否则会陷入重建循环：重建后 awaitingKeyframe 又丢弃所有
+     * 非 IDR 帧，解码器拿不到输入当然没输出，于是再次被判死，约 800ms 一次无限重建。
+     */
+    @Volatile
+    var inputsSinceLastOutput = 0
+        private set
+
+    /**
+     * 「自上次成功输出以来，第一次成功输入」的时刻。
+     *
+     * 不能记「最近一次输入」—— 那个值每帧都在更新，`now - it` 永远是 0，看门狗永远不会触发。
+     * 要的是「这批没被回应的输入是从什么时候开始堆积的」。
+     */
+    @Volatile
+    private var pendingSinceAt = 0L
+
     /** 累计送显帧数，供上层诊断/看门狗使用。 */
     @Volatile
     var outputFrameCount = 0L
@@ -168,6 +188,8 @@ class VideoDecoder(private val outputSurface: Surface) {
         initializedAt = android.os.SystemClock.elapsedRealtime()
         lastOutputAt = 0L
         outputFrameCount = 0L
+        inputsSinceLastOutput = 0
+        pendingSinceAt = 0L
         isInitialized = true
         startOutputThread()
         Logger.i("H.264 decoder initialized successfully")
@@ -187,6 +209,8 @@ class VideoDecoder(private val outputSurface: Surface) {
                         index >= 0 -> {
                             lastOutputAt = android.os.SystemClock.elapsedRealtime()
                             outputFrameCount++
+                            inputsSinceLastOutput = 0
+                            pendingSinceAt = 0L
                             codec.releaseOutputBuffer(index, true)
                         }
                         index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ->
@@ -257,6 +281,11 @@ class VideoDecoder(private val outputSurface: Surface) {
                     presentationTimeUs,
                     0                  // flags: 0 = normal frame (not end-of-stream)
                 )
+                // 只有真正排进去的帧才算「解码器被喂了数据」，看门狗据此判断卡死。
+                if (inputsSinceLastOutput == 0) {
+                    pendingSinceAt = android.os.SystemClock.elapsedRealtime()
+                }
+                inputsSinceLastOutput++
             } else {
                 // No input buffer available — the decoder is catching up.
                 // Drop this NAL unit to avoid building up backlog (prefer low latency).
@@ -323,17 +352,25 @@ class VideoDecoder(private val outputSurface: Surface) {
     }
 
     /**
-     * 解码器是否已经「卡死」—— 还在初始化状态，但超过 [STALL_TIMEOUT_MS] 没吐出任何一帧。
+     * 解码器是否已经「卡死」。
      *
-     * 判活必须用「输出」而不是「输入」：卡死时输入侧仍在正常收包（只是每帧都被丢弃），
-     * 只有输出端是真正停摆的。调用方看到 true 应当 [release] 并重建解码器。
+     * 判据是「**喂了数据却不出帧**」，而不是单纯的「多久没输出」：
+     * - 只看时间会误伤「没喂数据」的场景（Source 暂停、刚重建完还在等 IDR），
+     *   而重建后 awaitingKeyframe 会丢弃所有非 IDR 帧 —— 解码器拿不到输入当然没输出，
+     *   于是再次被判死，形成约 800ms 一次的无退避重建循环，反复创建销毁这颗硬解。
+     * - 真正的死锁是：输入侧仍在成功 queueInputBuffer（[inputsSinceLastOutput] 持续增长），
+     *   但输出端一个 buffer 都不归还。
      *
-     * 刚初始化时 [lastOutputAt] 为 0，此时用初始化时刻兜底，避免还没解出第一帧就被误判。
+     * 两个条件都要满足：[inputsSinceLastOutput] 达到 [STALL_MIN_INPUTS] 帧，
+     * 且距最近成功输入（或初始化）已超过 [STALL_TIMEOUT_MS]。
      */
     fun isStalled(): Boolean {
         if (!isInitialized || mediaCodec == null) return false
-        val last = lastOutputAt.takeIf { it > 0 } ?: initializedAt
-        return android.os.SystemClock.elapsedRealtime() - last > STALL_TIMEOUT_MS
+        if (inputsSinceLastOutput < STALL_MIN_INPUTS) return false
+        val reference = pendingSinceAt.takeIf { it > 0 }
+            ?: lastOutputAt.takeIf { it > 0 }
+            ?: initializedAt
+        return android.os.SystemClock.elapsedRealtime() - reference > STALL_TIMEOUT_MS
     }
 
     fun release() {
@@ -343,20 +380,52 @@ class VideoDecoder(private val outputSurface: Surface) {
         // 一边 dequeueOutputBuffer 一边 release 会在 native 层销毁仍在使用的互斥量，
         // 直接 SIGABRT 崩掉整个进程（AudioStreamServer 里踩过同类问题）。
         outputRunning = false
-        outputThread?.let { thread ->
-            runCatching { thread.join(500) }
-            if (thread.isAlive) Logger.w("VideoDecoder output thread did not exit in time")
-        }
+        val thread = outputThread
         outputThread = null
 
+        var threadExited = true
+        thread?.let {
+            runCatching { it.join(RELEASE_JOIN_MS) }
+            threadExited = !it.isAlive
+        }
+
+        val codec = mediaCodec
+        mediaCodec = null
+        isInitialized = false
+
+        // 输出线程没退出说明它卡在 native dequeueOutputBuffer 里 —— 这正是解码器死锁的
+        // 典型表现。此时**绝不能** stop()/release()：那会在 native 层销毁它仍在使用的
+        // 互斥量，触发 SIGABRT 崩掉整个进程；stop() 本身也可能永久阻塞，而它跑在
+        // TS 解复用线程上，会卡死整条接收流水线。
+        //
+        // 泄漏一个 codec 窗口远比进程崩溃好：调用方会立刻建新解码器继续出画面，
+        // 这个僵尸 codec 交给后台线程在它真正退出后再回收。
+        if (!threadExited) {
+            Logger.w("VideoDecoder: output thread still alive — deferring codec teardown")
+            Thread({
+                runCatching { thread?.join(RELEASE_JOIN_MS) }
+                if (thread?.isAlive == true) {
+                    // 线程彻底死了，交由进程退出回收；不碰 codec 以免崩溃
+                    Logger.e("VideoDecoder: output thread never exited, leaking codec")
+                    return@Thread
+                }
+                runCatching {
+                    codec?.stop()
+                    codec?.release()
+                }.onFailure { Logger.e("Deferred codec release failed", it) }
+                Logger.i("VideoDecoder: deferred codec teardown completed")
+            }, "VideoDecoderReaper").apply {
+                isDaemon = true
+                start()
+            }
+            return
+        }
+
         try {
-            mediaCodec?.stop()
-            mediaCodec?.release()
+            codec?.stop()
+            codec?.release()
         } catch (e: Exception) {
             Logger.e("Error releasing MediaCodec (non-fatal)", e)
-        } finally {
-            mediaCodec = null
-            isInitialized = false
         }
     }
 
@@ -385,6 +454,18 @@ class VideoDecoder(private val outputSurface: Surface) {
          * 留足余量是为了避开开机首个 IDR 之前的空窗和偶发 GC 抖动。
          */
         const val STALL_TIMEOUT_MS = 800L
+
+        /**
+         * 判定卡死前，至少要有这么多帧被**成功排入**解码器却没有换来任何输出。
+         *
+         * 取 20：60fps 下约 330ms 的输入量，远小于 800ms 时间阈值，所以真正起作用的是时间；
+         * 这个下限只是防止「刚灌了一两帧就判死」的边界抖动。更关键的是它排除了
+         * 「一直在丢弃、从未真正喂进数据」的情形 —— 那是没数据，不是卡死。
+         */
+        const val STALL_MIN_INPUTS = 20
+
+        /** 释放时等待输出线程退出的上限；超时说明它卡在 native 层，改用延迟回收。 */
+        private const val RELEASE_JOIN_MS = 500L
 
         /**
          * Parses the H.264 SPS NAL unit to extract the actual video resolution.
