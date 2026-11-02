@@ -1,5 +1,6 @@
 package com.weekd.miracastreceiver.miracast
 
+import com.weekd.miracastreceiver.BuildConfig
 import timber.log.Timber
 import java.io.ByteArrayOutputStream
 
@@ -50,6 +51,19 @@ class TsDemuxer(
         private const val STREAM_TYPE_LPCM = 0x83    // WFD 规范里 LPCM 用 private stream 0x83
     }
 
+    // ─── 诊断计数器（仅 debug 构建）────────────────────────────────────────
+    // BuildConfig.DEBUG 是编译期常量，release 构建时下面整个分支会被消除，
+    // 运行时零开销、字节码里也不存在。
+    private var statTsPackets = 0L
+    private var statSyncLost = 0L
+    private var statNullPkts = 0L
+    private var statPatSeen = 0L
+    private var statPmtSeen = 0L
+    private var statVideoPkts = 0L
+    private var statVideoPes = 0L
+    private var statAudioPkts = 0L
+    private var statLastReport = System.currentTimeMillis()
+
     /** 喂入一段 TS 数据（必须是 188 字节包对齐的，RTP 负载天然满足）。 */
     fun feed(data: ByteArray, offset: Int, length: Int) {
         var pos = offset
@@ -57,11 +71,27 @@ class TsDemuxer(
         while (pos + TS_PACKET_SIZE <= end) {
             if (data[pos] != SYNC_BYTE) {
                 pos++            // 失步了，逐字节找回同步字节
+                if (BuildConfig.DEBUG) statSyncLost++
                 continue
             }
             handlePacket(data, pos)
+            if (BuildConfig.DEBUG) statTsPackets++
             pos += TS_PACKET_SIZE
         }
+        if (BuildConfig.DEBUG) reportStats()
+    }
+
+    /** 每秒打印一次解复用进度，用于判断视频链路卡在哪一层。仅 debug 构建。 */
+    private fun reportStats() {
+        val now = System.currentTimeMillis()
+        if (now - statLastReport < 1000) return
+        statLastReport = now
+        Timber.i(
+            "TS stats: packets=$statTsPackets syncLost=$statSyncLost nullPkts=$statNullPkts " +
+                "pat=$statPatSeen pmt=$statPmtSeen pmtPid=$pmtPid " +
+                "videoPkts=$statVideoPkts videoPid=$videoPid videoPes=$statVideoPes " +
+                "audioPkts=$statAudioPkts audioPid=$audioPid"
+        )
     }
 
     private fun handlePacket(data: ByteArray, start: Int) {
@@ -74,6 +104,7 @@ class TsDemuxer(
         val pid = ((b1 and 0x1F) shl 8) or b2
         val adaptationControl = (b3 shr 4) and 0x03
 
+        if (BuildConfig.DEBUG && pid == 0x1FFF) statNullPkts++
         if (adaptationControl == 0 || adaptationControl == 2) return   // 无负载
 
         var payloadStart = start + 4
@@ -86,14 +117,16 @@ class TsDemuxer(
 
         val continuity = b3 and 0x0F
         when (pid) {
-            0 -> parsePat(data, payloadStart, payloadEnd, payloadUnitStart)
-            pmtPid -> parsePmt(data, payloadStart, payloadEnd, payloadUnitStart)
+            0 -> { if (BuildConfig.DEBUG) statPatSeen++; parsePat(data, payloadStart, payloadEnd, payloadUnitStart) }
+            pmtPid -> { if (BuildConfig.DEBUG) statPmtSeen++; parsePmt(data, payloadStart, payloadEnd, payloadUnitStart) }
             videoPid -> {
+                if (BuildConfig.DEBUG) statVideoPkts++
                 // 丢了包的帧一定是残缺的，喂给解码器只会花屏，还会沿帧间预测扩散。
                 if (videoPes.checkContinuity(continuity)) onDiscontinuity()
                 videoPes.onPacket(data, payloadStart, payloadEnd, payloadUnitStart)
             }
             audioPid -> {
+                if (BuildConfig.DEBUG) statAudioPkts++
                 if (audioPes.checkContinuity(continuity)) onAudioDiscontinuity()
                 audioPes.onPacket(data, payloadStart, payloadEnd, payloadUnitStart)
             }

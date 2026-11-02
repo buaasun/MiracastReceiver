@@ -35,6 +35,7 @@ object AppSettings {
         prefs(context).edit().putString(KEY_LANGUAGE, tag).apply()
     }
 
-    private fun prefs(context: Context) =
+    /** 供 [com.weekd.miracastreceiver.miracast.MiracastTuning] 等模块复用的同一份 prefs。 */
+    fun prefs(context: Context) =
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 }

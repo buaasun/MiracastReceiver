@@ -6,6 +6,13 @@
     <string name="device_ip_fetching">获取中...</string>
     <string name="how_to_connect">如何连接</string>
     <string name="connect_instruction">1. 确保发送设备与电视在同一局域网\n2. 打开发送端应用\n3. 扫描并选择此设备\n4. 开始投屏</string>
+
+    <!-- 调试选项（仅 debug 构建显示） -->
+    <string name="debug_settings_title">调试选项</string>
+    <string name="debug_settings_hint">仅 debug 版可见。用于在同一台设备上逐项开关，对比哪项改动是必需的；改动在下次投屏会话生效。</string>
+    <string name="tuning_dual_client_port">SETUP 声明 RTCP 端口</string>
+    <string name="tuning_rtcp_port">绑定并消费 RTCP 端口</string>
+    <string name="tuning_socket_dynamic">动态枚举 wpa_supplicant socket</string>
     <string name="auto_start_on_boot">开机自动启动接收服务</string>
     <string name="auto_start_on_boot_hint">电视开机后在后台自动运行，无需手动打开本应用。部分电视需要在系统设置里允许本应用自启动。</string>
     <string name="language">语言</string>

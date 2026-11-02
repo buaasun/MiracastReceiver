@@ -1,6 +1,7 @@
 package com.weekd.miracastreceiver.miracast
 
 import android.view.Surface
+import com.weekd.miracastreceiver.BuildConfig
 import com.weekd.miracastreceiver.airplay.VideoDecoder
 import timber.log.Timber
 
@@ -36,12 +37,34 @@ class MiracastVideoRenderer(private val surfaceProvider: () -> Surface?) {
         }
     }
 
+    // ─── 诊断计数器（仅 debug 构建，release 会被编译掉）────────────────────
+    private var statUnits = 0L
+    private var statDecoded = 0L
+    private var statDroppedNoSurface = 0L
+    private var statDroppedNoConfig = 0L
+    private var statDroppedNoIdr = 0L
+    private var statLastReport = System.currentTimeMillis()
+
+    private fun reportStats() {
+        val now = System.currentTimeMillis()
+        if (now - statLastReport < 1000) return
+        statLastReport = now
+        Timber.i(
+            "Miracast video stats: units=$statUnits decoded=$statDecoded " +
+                "noSurface=$statDroppedNoSurface noConfig=$statDroppedNoConfig " +
+                "noIdr=$statDroppedNoIdr hasSps=${sps != null} hasPps=${pps != null} " +
+                "decoder=${decoder != null} awaitingKeyframe=$awaitingKeyframe"
+        )
+    }
+
     /** [TsDemuxer] 的回调入口。 */
     fun onAccessUnit(unit: ByteArray, ptsUs: Long) {
+        if (BuildConfig.DEBUG) { statUnits++; reportStats() }
         captureParameterSets(unit)
 
         val surface = surfaceProvider()
         if (surface == null || !surface.isValid) {
+            if (BuildConfig.DEBUG) statDroppedNoSurface++
             releaseDecoder()
             return
         }
@@ -56,6 +79,7 @@ class MiracastVideoRenderer(private val surfaceProvider: () -> Surface?) {
         // Surface 变了（应用切后台再回前台会换新的）就重建解码器，否则画面会一直黑
         if (decoder == null || surface !== configuredSurface) {
             if (!rebuildDecoder(surface)) {
+                if (BuildConfig.DEBUG) statDroppedNoConfig++
                 droppedBeforeConfig++
                 if (droppedBeforeConfig % 60 == 0) {
                     Timber.d("Miracast: waiting for SPS/PPS, dropped $droppedBeforeConfig units")
@@ -66,11 +90,15 @@ class MiracastVideoRenderer(private val surfaceProvider: () -> Surface?) {
 
         // 新解码器必须从 IDR 开始，否则解出来是花的
         if (awaitingKeyframe) {
-            if (!containsIdr(unit)) return
+            if (!containsIdr(unit)) {
+                if (BuildConfig.DEBUG) statDroppedNoIdr++
+                return
+            }
             awaitingKeyframe = false
             Timber.i("Miracast: keyframe found, decoding started")
         }
 
+        if (BuildConfig.DEBUG) statDecoded++
         decoder?.decodeNalUnit(unit, ptsUs)
     }
 

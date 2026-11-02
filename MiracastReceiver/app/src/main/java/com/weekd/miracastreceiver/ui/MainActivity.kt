@@ -16,13 +16,17 @@ import androidx.appcompat.widget.SwitchCompat
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import com.weekd.miracastreceiver.BuildConfig
 import com.weekd.miracastreceiver.R
 import com.weekd.miracastreceiver.discovery.DeviceInfoProvider
 import com.weekd.miracastreceiver.discovery.MdnsAdvertiser
+import com.weekd.miracastreceiver.miracast.MiracastTuning
+import com.weekd.miracastreceiver.miracast.WfdRootHelper
 import com.weekd.miracastreceiver.service.CastReceiverService
 import com.weekd.miracastreceiver.util.AppLanguage
 import com.weekd.miracastreceiver.util.AppSettings
 import com.weekd.miracastreceiver.utils.NetworkUtils
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import timber.log.Timber
@@ -185,9 +189,52 @@ class MainActivity : AppCompatActivity() {
         findViewById<View>(R.id.setting_language).setOnClickListener { showLanguageDialog() }
         tvLanguageValue.text = currentLanguageLabel()
 
+        initDebugSettings()
+
         // 设置设备名称
         val deviceName = deviceInfoProvider.getDeviceName()
         tvDeviceName.text = deviceName
+    }
+
+    /**
+     * Miracast 调试开关，只有 debug 构建才显示。
+     *
+     * 这几个开关存在同一份 [AppSettings] prefs 里，release 构建里这块布局保持 GONE，
+     * 用户看到的界面和上游一致；而 debug 版可以直接在电视上改，不用重新编译。
+     */
+    private fun initDebugSettings() {
+        val group = findViewById<View>(R.id.debug_settings)
+        if (!BuildConfig.DEBUG) {
+            group.visibility = View.GONE
+            return
+        }
+        group.visibility = View.VISIBLE
+
+        bindTuningSwitch(R.id.switch_dual_client_port, MiracastTuning.isDualClientPort(this)) { on ->
+            MiracastTuning.setDualClientPort(this, on)
+        }
+        bindTuningSwitch(R.id.switch_rtcp_port, MiracastTuning.isRtcpPortEnabled(this)) { on ->
+            MiracastTuning.setRtcpPortEnabled(this, on)
+        }
+        // socket 路径只在服务启动时解析一次，改完立刻重播一次 WFD IE，省得重启应用。
+        // advertiseSink 内部会 fork su，不能放主线程。
+        bindTuningSwitch(R.id.switch_socket_dynamic, MiracastTuning.isSocketPathDynamic(this)) { on ->
+            MiracastTuning.setSocketPathDynamic(this, on)
+            val app = applicationContext
+            lifecycleScope.launch(Dispatchers.IO) {
+                val ok = WfdRootHelper.advertiseSink(app)
+                Timber.i("Miracast tuning: re-advertised sink after socket mode change (ok=$ok)")
+            }
+        }
+    }
+
+    private fun bindTuningSwitch(id: Int, initial: Boolean, onChange: (Boolean) -> Unit) {
+        val view = findViewById<SwitchCompat>(id)
+        view.isChecked = initial
+        view.setOnCheckedChangeListener { _, isChecked ->
+            onChange(isChecked)
+            Timber.i("Miracast tuning ${resources.getResourceEntryName(id)} = $isChecked")
+        }
     }
 
     /** 第一项是「跟随系统」，其后是 [AppLanguage.OPTIONS]。 */

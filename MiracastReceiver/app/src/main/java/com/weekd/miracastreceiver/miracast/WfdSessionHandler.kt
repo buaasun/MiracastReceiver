@@ -232,15 +232,21 @@ class WfdSessionHandler(
         if (presentationUrl.isEmpty()) {
             presentationUrl = "rtsp://${socket.inetAddress.hostAddress}/wfd1.0/streamid=0"
         }
-        // WFD 规范（以及 RFC 2326 §12.39）要求 client_port 给出 RTP 和 RTCP 两个端口：
-        //   client_port=<RTP port>[-<RTCP port>]
-        // 只写一个端口时，部分 Source（实测 Windows 11 MSMiracastSource）会接受 SETUP
-        // 但不启动推流 —— 表现为 RTSP 会话存活、UDP 端口已监听，却一个包都收不到。
+        // RFC 2326 §12.39 的语法是 `client_port = port [ "-" port ]`，第二个端口可选；
+        // 但语义上它是 RTP/RTCP 端口对。实测 Windows 11 会往 RTCP 端口发
+        // `MF_SEND_RATE@0.0.0.0:0` 私有扩展包，只声明单端口时是否影响推流尚未确认，
+        // 因此做成开关（见 [MiracastTuning.isDualClientPort]）以便同机对比。
+        val ports = if (MiracastTuning.isDualClientPort(context)) {
+            "$rtpPort-${rtpPort + 1}"
+        } else {
+            "$rtpPort"
+        }
         setupSent = true
+        Timber.i("WFD: SETUP client_port=$ports")
         send(
             "SETUP $presentationUrl RTSP/1.0\r\n" +
                 "CSeq: ${++outCseq}\r\n" +
-                "Transport: RTP/AVP/UDP;unicast;client_port=$rtpPort-${rtpPort + 1}\r\n\r\n"
+                "Transport: RTP/AVP/UDP;unicast;client_port=$ports\r\n\r\n"
         )
     }
 

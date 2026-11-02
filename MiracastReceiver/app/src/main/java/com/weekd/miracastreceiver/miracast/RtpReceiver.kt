@@ -1,6 +1,8 @@
 package com.weekd.miracastreceiver.miracast
 
+import android.content.Context
 import android.view.Surface
+import com.weekd.miracastreceiver.BuildConfig
 import kotlinx.coroutines.*
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -24,6 +26,7 @@ import java.net.DatagramSocket
  * @param surfaceProvider 送显目标，应用切后台时返回 null
  */
 class RtpReceiver(
+    private val context: Context,
     private val port: Int,
     private val surfaceProvider: () -> Surface?
 ) {
@@ -92,12 +95,17 @@ class RtpReceiver(
                     // 默认接收缓冲只有几十 KB，2.5Mbps 的流稍有调度延迟就会溢出丢包
                     runCatching { receiveBufferSize = 1024 * 1024 }
                 }
-                // SETUP 的 Transport 头声明了 client_port=<rtp>-<rtcp>，RTCP 端口必须真的
-                // 有人监听：部分 Source 会先发一个 RTCP 包探测，无人接收就判定 sink 不可用
-                // 而拒绝推流（实测表现为 SETUP 成功、PLAY 成功，但 RTP 一个包都不来）。
-                rtcpSocket = runCatching { DatagramSocket(port + 1) }.getOrNull()
-                if (rtcpSocket == null) {
-                    Timber.w("RTCP socket on UDP ${port + 1} unavailable (port busy?)")
+                // SETUP 声明了 client_port=<rtp>-<rtcp> 时，Source 会真的往 RTCP 端口发包
+                // （实测 Windows 11 每 ~2.5s 一个 RTCP SR，尾部还带 MF_SEND_RATE 私有扩展）。
+                // 端口必须绑定**并且被消费**：只绑不读，内核 rx_queue 会一直涨到满，之后
+                // 开始丢包。这里只排空不解析。
+                if (MiracastTuning.isRtcpPortEnabled(context)) {
+                    rtcpSocket = runCatching { DatagramSocket(port + 1) }.getOrNull()
+                    if (rtcpSocket == null) {
+                        Timber.w("RTCP socket on UDP ${port + 1} unavailable (port busy?)")
+                    } else {
+                        startRtcpDrain(rtcpSocket!!)
+                    }
                 }
                 isRunning = true
                 Timber.i("RTP Receiver listening on UDP $port (expecting MPEG-2 TS, PT=33), " +
@@ -162,6 +170,38 @@ class RtpReceiver(
                 onError?.invoke("RTP 接收启动失败: ${e.message}")
                 isRunning = false
             }
+        }
+    }
+
+    /**
+     * 排空 RTCP 端口。
+     *
+     * 只消费不解析：这些包的用途是让 Source 认为 sink 的 RTCP 通道活着，
+     * 内容（Sender Report + 厂商私有扩展）对画面没有影响。不排空的话
+     * 内核 rx_queue 会持续堆积到上限后开始丢包。
+     */
+    private fun startRtcpDrain(sock: DatagramSocket) {
+        scope.launch {
+            val buf = ByteArray(1500)
+            val pkt = DatagramPacket(buf, buf.size)
+            var count = 0L
+            var lastLog = System.currentTimeMillis()
+            while (isRunning) {
+                try {
+                    pkt.length = buf.size
+                    sock.receive(pkt)
+                    count++
+                    val now = System.currentTimeMillis()
+                    if (BuildConfig.DEBUG && now - lastLog >= 5000) {
+                        lastLog = now
+                        Timber.d("RTCP drained $count packets (last ${pkt.length}B)")
+                    }
+                } catch (e: Exception) {
+                    if (isRunning) Timber.e(e, "RTCP drain error")
+                    break
+                }
+            }
+            Timber.i("RTCP drain stopped after $count packets")
         }
     }
 

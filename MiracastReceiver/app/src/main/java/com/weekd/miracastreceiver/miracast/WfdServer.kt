@@ -132,7 +132,7 @@ class WfdServer(
         // RTP 接收必须先起来：M3 会把端口告诉 Source，M7 之后随时可能来包。
         // 送显目标复用镜像专用 SurfaceView（与 AirPlay 镜像同一块），
         // 播放页尚未创建时返回 null，解码器会等它就绪。
-        val receiver = RtpReceiver(rtpPort, { com.weekd.miracastreceiver.ui.PlayerActivity.mirrorSurface }).apply {
+        val receiver = RtpReceiver(context, rtpPort, { com.weekd.miracastreceiver.ui.PlayerActivity.mirrorSurface }).apply {
             onError = { Timber.e("Miracast RTP error: $it") }
             start()
         }

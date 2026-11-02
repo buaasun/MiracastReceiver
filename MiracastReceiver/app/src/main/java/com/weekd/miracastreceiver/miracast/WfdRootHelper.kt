@@ -41,7 +41,19 @@ object WfdRootHelper {
      * 实测（Amlogic S905L3 + 展锐 WiFi）：写 p2p-dev-wlan0 之后，wpa_supplicant
      * 会自动把 WFD_SUBELEM 同步到所有 p2p-wlan0-N（GO）接口，因此只需要命中它。
      */
-    private fun resolveSocketPath(): String? {
+    private fun resolveSocketPath(context: Context): String? {
+        // 关掉动态枚举时退回改前的硬编码行为，用于验证「socket 命名差异」
+        // 到底是不是某些设备连不上的原因（见 [MiracastTuning.isSocketPathDynamic]）
+        if (!MiracastTuning.isSocketPathDynamic(context)) {
+            for (dir in CTRL_SOCKET_DIRS) {
+                if (runAsRoot("test -S $dir/p2p0")) return "$dir/p2p0"
+            }
+            for (dir in CTRL_SOCKET_DIRS) {
+                if (runAsRoot("test -S $dir/wlan0")) return "$dir/wlan0"
+            }
+            return null
+        }
+
         for (dir in CTRL_SOCKET_DIRS) {
             val listing = runAsRootOutput("ls -1 $dir 2>/dev/null") ?: continue
             val names = listing.lines().map { it.trim() }.filter { it.isNotEmpty() }
@@ -81,7 +93,7 @@ object WfdRootHelper {
             return false
         }
 
-        val socketPath = resolveSocketPath()
+        val socketPath = resolveSocketPath(context)
         if (socketPath == null) {
             Timber.w("WFD: no wpa_supplicant control socket found (no root?)")
             return false
@@ -104,7 +116,7 @@ object WfdRootHelper {
     fun stopAdvertising(context: Context): Boolean {
         val binary = File(context.applicationInfo.nativeLibraryDir, BINARY_NAME)
         if (!binary.exists()) return false
-        val socketPath = resolveSocketPath() ?: return false
+        val socketPath = resolveSocketPath(context) ?: return false
         return runAsRoot("${binary.absolutePath} $socketPath \"SET wifi_display 0\"")
     }
 

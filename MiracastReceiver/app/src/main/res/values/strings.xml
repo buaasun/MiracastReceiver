@@ -9,6 +9,13 @@
     <string name="device_ip_fetching">Detecting…</string>
     <string name="how_to_connect">How to connect</string>
     <string name="connect_instruction">1. Make sure the sending device and the TV are on the same local network\n2. Open the casting app on the sender\n3. Scan for and select this device\n4. Start casting</string>
+
+    <!-- 调试选项（仅 debug 构建显示，见 MainActivity 里的 BuildConfig.DEBUG 判断） -->
+    <string name="debug_settings_title">Debug options</string>
+    <string name="debug_settings_hint">Only visible in debug builds. Toggle these to compare Miracast behaviour on the same device; each change takes effect on the next cast session.</string>
+    <string name="tuning_dual_client_port">Declare RTCP port in SETUP</string>
+    <string name="tuning_rtcp_port">Bind and drain the RTCP port</string>
+    <string name="tuning_socket_dynamic">Enumerate wpa_supplicant sockets dynamically</string>
     <string name="auto_start_on_boot">Start receiver on boot</string>
     <string name="auto_start_on_boot_hint">Runs in the background after the TV turns on, without opening this app. Some TVs also require allowing auto-start for this app in system settings.</string>
     <string name="language">Language</string>
