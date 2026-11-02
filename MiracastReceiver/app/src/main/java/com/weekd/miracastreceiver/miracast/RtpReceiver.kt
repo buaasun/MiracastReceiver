@@ -95,6 +95,10 @@ class RtpReceiver(
                     // 默认接收缓冲只有几十 KB，2.5Mbps 的流稍有调度延迟就会溢出丢包
                     runCatching { receiveBufferSize = 1024 * 1024 }
                 }
+                // 必须先置位再起 RTCP drain 协程：drain 循环拿它当退出条件，
+                // 晚一步的话协程可能读到 false 直接退出
+                isRunning = true
+
                 // SETUP 声明了 client_port=<rtp>-<rtcp> 时，Source 会真的往 RTCP 端口发包
                 // （实测 Windows 11 每 ~2.5s 一个 RTCP SR，尾部还带 MF_SEND_RATE 私有扩展）。
                 // 端口必须绑定**并且被消费**：只绑不读，内核 rx_queue 会一直涨到满，之后
@@ -107,7 +111,6 @@ class RtpReceiver(
                         startRtcpDrain(rtcpSocket!!)
                     }
                 }
-                isRunning = true
                 Timber.i("RTP Receiver listening on UDP $port (expecting MPEG-2 TS, PT=33), " +
                     "rtcp=${if (rtcpSocket != null) port + 1 else "none"}, " +
                     "recvBuf=${socket?.receiveBufferSize}")
