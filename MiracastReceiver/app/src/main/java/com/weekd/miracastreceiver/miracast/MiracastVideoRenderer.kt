@@ -27,14 +27,18 @@ class MiracastVideoRenderer(private val surfaceProvider: () -> Surface?) {
     private var droppedBeforeConfig = 0
 
     /**
-     * 数据有丢失时调用：残缺的帧会让解码器输出花屏，而且错误会沿着帧间预测一直传播下去，
-     * 所以必须丢弃后续帧直到下一个 IDR 才重新开始解码。
+     * 数据有丢失时调用。
+     *
+     * 丢的如果是 IDR 之前的参考帧，后续 P 帧确实会花屏并沿帧间预测扩散，需要等下一个 IDR。
+     * 但「等到 IDR」的代价很高：实测 Windows 的 GOP 约 2~3 秒，期间画面完全静止。
+     *
+     * 这里只丢弃**已经开始拼装的那一帧**（TsDemuxer 的 discardPending 已经做了），
+     * 不把后续所有帧一起判死 —— 让 MediaCodec 自己应对个别缺失的参考帧，
+     * 它的错误隐藏比「整段冻结」体验好得多。
+     * 真正的解码错误会由 VideoDecoder 自己的异常路径处理并重建解码器。
      */
     fun onDiscontinuity() {
-        if (!awaitingKeyframe) {
-            awaitingKeyframe = true
-            Timber.w("Miracast: data loss detected, waiting for next keyframe")
-        }
+        if (BuildConfig.DEBUG) statDiscontinuities++
     }
 
     // ─── 诊断计数器（仅 debug 构建，release 会被编译掉）────────────────────
@@ -43,6 +47,7 @@ class MiracastVideoRenderer(private val surfaceProvider: () -> Surface?) {
     private var statDroppedNoSurface = 0L
     private var statDroppedNoConfig = 0L
     private var statDroppedNoIdr = 0L
+    private var statDiscontinuities = 0L
     private var statLastReport = System.currentTimeMillis()
 
     private fun reportStats() {
@@ -52,7 +57,7 @@ class MiracastVideoRenderer(private val surfaceProvider: () -> Surface?) {
         Timber.i(
             "Miracast video stats: units=$statUnits decoded=$statDecoded " +
                 "noSurface=$statDroppedNoSurface noConfig=$statDroppedNoConfig " +
-                "noIdr=$statDroppedNoIdr hasSps=${sps != null} hasPps=${pps != null} " +
+                "noIdr=$statDroppedNoIdr disc=$statDiscontinuities hasSps=${sps != null} hasPps=${pps != null} " +
                 "decoder=${decoder != null} awaitingKeyframe=$awaitingKeyframe"
         )
     }

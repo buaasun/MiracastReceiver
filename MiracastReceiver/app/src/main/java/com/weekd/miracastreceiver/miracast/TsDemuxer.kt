@@ -228,14 +228,23 @@ class TsDemuxer(
 
         /**
          * 连续计数器每包 +1（模 16），跳变即代表 TS 层丢包。
+         *
+         * 重复包不算丢包：网络里重传/镜像会把同一个 continuity 再送一次，
+         * 用 `!=` 判断会把它误判成跳变，白等一次关键帧。
+         *
          * @return true 表示发生了丢包，正在拼装的残缺数据已丢弃
          */
         fun checkContinuity(continuity: Int): Boolean {
-            val gap = lastContinuity >= 0 && continuity != (lastContinuity + 1) % 16
+            if (lastContinuity < 0) {
+                lastContinuity = continuity
+                return false
+            }
+            if (continuity == lastContinuity) return false          // 重复包，静默吞掉
+            val expected = (lastContinuity + 1) and 0x0F
             lastContinuity = continuity
-            if (!gap) return false
+            if (continuity == expected) return false
             lossCount++
-            Timber.w("TS: $name continuity gap, total $lossCount")
+            Timber.w("TS: $name continuity gap (${expected}→$continuity), total $lossCount")
             discardPending()
             return true
         }

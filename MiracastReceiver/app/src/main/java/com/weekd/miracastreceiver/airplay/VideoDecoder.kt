@@ -329,7 +329,11 @@ class VideoDecoder(private val outputSurface: Surface) {
         // 超时只是为了让线程有机会检查退出标志，不影响送显延迟。
         private const val OUTPUT_BUFFER_TIMEOUT_US = 20_000L
 
-        private const val INPUT_BUFFER_TIMEOUT_US = 100_000L
+        // 5ms —— 这个超时发生在**调用方的线程**上（Miracast 是解复用线程，AirPlay 是解码
+        // 线程），等久了整条流水线停摆：实测 100ms 时一次卡顿就能让接收队列堆满并溢出，
+        // 进而丢包 → 等关键帧 → 画面冻结数秒。解码器拿不到空缓冲区说明它已满负荷，
+        // 再等只会加剧上游积压，不如直接丢掉这一帧。
+        private const val INPUT_BUFFER_TIMEOUT_US = 5_000L
 
         /**
          * Parses the H.264 SPS NAL unit to extract the actual video resolution.
