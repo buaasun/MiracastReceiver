@@ -29,6 +29,8 @@ class RtpReceiver(
 ) {
 
     private var socket: DatagramSocket? = null
+    /** RTCP 接收端口（port+1）。内容不解析，只是为了满足 Source 的探测。 */
+    private var rtcpSocket: DatagramSocket? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     @Volatile
@@ -90,8 +92,16 @@ class RtpReceiver(
                     // 默认接收缓冲只有几十 KB，2.5Mbps 的流稍有调度延迟就会溢出丢包
                     runCatching { receiveBufferSize = 1024 * 1024 }
                 }
+                // SETUP 的 Transport 头声明了 client_port=<rtp>-<rtcp>，RTCP 端口必须真的
+                // 有人监听：部分 Source 会先发一个 RTCP 包探测，无人接收就判定 sink 不可用
+                // 而拒绝推流（实测表现为 SETUP 成功、PLAY 成功，但 RTP 一个包都不来）。
+                rtcpSocket = runCatching { DatagramSocket(port + 1) }.getOrNull()
+                if (rtcpSocket == null) {
+                    Timber.w("RTCP socket on UDP ${port + 1} unavailable (port busy?)")
+                }
                 isRunning = true
                 Timber.i("RTP Receiver listening on UDP $port (expecting MPEG-2 TS, PT=33), " +
+                    "rtcp=${if (rtcpSocket != null) port + 1 else "none"}, " +
                     "recvBuf=${socket?.receiveBufferSize}")
 
                 val buffer = ByteArray(65536)
@@ -205,6 +215,12 @@ class RtpReceiver(
             socket = null
         } catch (e: Exception) {
             Timber.e(e, "Error closing RTP socket")
+        }
+        try {
+            rtcpSocket?.close()
+            rtcpSocket = null
+        } catch (e: Exception) {
+            Timber.e(e, "Error closing RTCP socket")
         }
         Timber.i("RTP Receiver stopped: $packetsReceived packets, ${bytesReceived / 1024}KB")
     }

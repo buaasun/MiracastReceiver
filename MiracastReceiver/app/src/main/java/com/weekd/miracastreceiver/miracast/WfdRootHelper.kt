@@ -19,13 +19,44 @@ object WfdRootHelper {
 
     private const val BINARY_NAME = "libwfdctl.so"
 
-    /** wpa_supplicant 控制 socket 的常见位置，按新旧顺序尝试。 */
-    private val CTRL_SOCKET_PATHS = listOf(
-        "/data/vendor/wifi/wpa/sockets/p2p0",
-        "/data/misc/wifi/sockets/p2p0",
-        "/data/vendor/wifi/wpa/sockets/wlan0",
-        "/data/misc/wifi/sockets/wlan0"
+    /**
+     * wpa_supplicant 控制 socket 所在目录，按新旧系统顺序尝试。
+     *
+     * 注意这里只给目录，具体用哪个 socket 靠 [resolveSocketPath] 动态枚举。
+     * 早期版本把接口名硬编码成 `p2p0`，但不同厂商的命名完全不同：
+     *   - 老机型 / 标准实现：p2p0
+     *   - Amlogic / 展锐等定制 ROM：p2p-dev-wlan0 + p2p-wlan0-N（N 每次建组都变）
+     * 硬编码会导致兜底落到 wlan0 —— 那是 STA 接口，写入后 WFD IE 只进全局配置，
+     * P2P 接口上拿不到，Source 的 Provision Discovery 请求就永远等不到应答。
+     */
+    private val CTRL_SOCKET_DIRS = listOf(
+        "/data/vendor/wifi/wpa/sockets",
+        "/data/misc/wifi/sockets"
     )
+
+    /**
+     * 解析实际可用的控制 socket。
+     *
+     * 优先级：p2p-dev-* > p2p0 > p2p-wlan0-N > wlan0。
+     * 实测（Amlogic S905L3 + 展锐 WiFi）：写 p2p-dev-wlan0 之后，wpa_supplicant
+     * 会自动把 WFD_SUBELEM 同步到所有 p2p-wlan0-N（GO）接口，因此只需要命中它。
+     */
+    private fun resolveSocketPath(): String? {
+        for (dir in CTRL_SOCKET_DIRS) {
+            val listing = runAsRootOutput("ls -1 $dir 2>/dev/null") ?: continue
+            val names = listing.lines().map { it.trim() }.filter { it.isNotEmpty() }
+
+            // p2p-dev-*：P2P device 接口，写入后会同步到 GO 接口，最优选
+            names.firstOrNull { it.startsWith("p2p-dev") }?.let { return "$dir/$it" }
+            names.firstOrNull { it == "p2p0" }?.let { return "$dir/$it" }
+            names.firstOrNull { it.startsWith("p2p-wlan") }?.let { return "$dir/$it" }
+        }
+        // 最后才退回 STA 接口：能广播 WFD IE，但 P2P 握手仍然不可用
+        for (dir in CTRL_SOCKET_DIRS) {
+            if (runAsRoot("test -S $dir/wlan0")) return "$dir/wlan0"
+        }
+        return null
+    }
 
     /**
      * WFD 设备信息子元素（子元素 0），共 6 字节负载：
@@ -50,7 +81,7 @@ object WfdRootHelper {
             return false
         }
 
-        val socketPath = CTRL_SOCKET_PATHS.firstOrNull { runAsRoot("ls $it") }
+        val socketPath = resolveSocketPath()
         if (socketPath == null) {
             Timber.w("WFD: no wpa_supplicant control socket found (no root?)")
             return false
@@ -73,7 +104,7 @@ object WfdRootHelper {
     fun stopAdvertising(context: Context): Boolean {
         val binary = File(context.applicationInfo.nativeLibraryDir, BINARY_NAME)
         if (!binary.exists()) return false
-        val socketPath = CTRL_SOCKET_PATHS.firstOrNull { runAsRoot("ls $it") } ?: return false
+        val socketPath = resolveSocketPath() ?: return false
         return runAsRoot("${binary.absolutePath} $socketPath \"SET wifi_display 0\"")
     }
 
@@ -91,5 +122,18 @@ object WfdRootHelper {
     } catch (e: Exception) {
         Timber.d("WFD root unavailable: ${e.message}")
         false
+    }
+
+    /** 同 [runAsRoot]，但返回命令输出（用于枚举 socket 目录）。 */
+    private fun runAsRootOutput(command: String): String? = try {
+        val process = ProcessBuilder("su", "-c", command)
+            .redirectErrorStream(true)
+            .start()
+        val output = process.inputStream.bufferedReader().readText().trim()
+        process.waitFor()
+        output
+    } catch (e: Exception) {
+        Timber.d("WFD root unavailable: ${e.message}")
+        null
     }
 }

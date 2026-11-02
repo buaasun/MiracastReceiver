@@ -40,6 +40,7 @@ class WfdSessionHandler(
     private var sessionId = ""
     private var presentationUrl = ""
     private var playRequested = false
+    private var setupSent = false            // 已发出 SETUP，等待其响应
 
     var onSessionEstablished: ((sessionId: String) -> Unit)? = null
     var onStreamStart: ((rtpPort: Int) -> Unit)? = null
@@ -182,10 +183,32 @@ class WfdSessionHandler(
 
     // ─── 处理 Source 对我们请求的响应 ────────────────────────────────────────
     private fun handleResponse(msg: String) {
+        // 响应码必须校验：SETUP 失败时 Source 会回 4xx/5xx，且往往不带 Session 头。
+        // 旧实现只看 Session 头，失败时静默跳过 —— 会话卡死但日志里看不出任何异常。
+        val statusLine = msg.lineSequence().firstOrNull().orEmpty()
+        val statusCode = statusLine.split(' ').getOrNull(1)?.toIntOrNull()
+        val isOk = statusCode != null && statusCode in 200..299
+
+        if (!isOk) {
+            Timber.e("WFD: source returned $statusLine (SETUP sent=$setupSent)")
+            if (setupSent) {
+                Timber.e("WFD: SETUP rejected — check Transport header formatting")
+                onStreamStop?.invoke()
+                close()
+            }
+            return
+        }
+
         val session = header(msg, "Session")?.substringBefore(';')
-        if (!session.isNullOrBlank() && sessionId.isEmpty()) {
-            sessionId = session
-            Timber.i("WFD: session id = $sessionId")
+        if (setupSent && sessionId.isEmpty()) {
+            // SETUP 的 200 响应：拿到 Session ID 后发 PLAY
+            setupSent = false
+            if (session.isNullOrBlank()) {
+                Timber.w("WFD: SETUP 200 but no Session header — continuing without it")
+            } else {
+                sessionId = session
+                Timber.i("WFD: session id = $sessionId")
+            }
             onSessionEstablished?.invoke(sessionId)
             sendPlay()                                           // M7
         } else if (playRequested) {
@@ -193,6 +216,8 @@ class WfdSessionHandler(
             onStreamStart?.invoke(rtpPort)
             startPlayerActivity()
             playRequested = false
+        } else {
+            Timber.d("WFD: response $statusLine (no pending action)")
         }
     }
 
@@ -207,10 +232,15 @@ class WfdSessionHandler(
         if (presentationUrl.isEmpty()) {
             presentationUrl = "rtsp://${socket.inetAddress.hostAddress}/wfd1.0/streamid=0"
         }
+        // WFD 规范（以及 RFC 2326 §12.39）要求 client_port 给出 RTP 和 RTCP 两个端口：
+        //   client_port=<RTP port>[-<RTCP port>]
+        // 只写一个端口时，部分 Source（实测 Windows 11 MSMiracastSource）会接受 SETUP
+        // 但不启动推流 —— 表现为 RTSP 会话存活、UDP 端口已监听，却一个包都收不到。
+        setupSent = true
         send(
             "SETUP $presentationUrl RTSP/1.0\r\n" +
                 "CSeq: ${++outCseq}\r\n" +
-                "Transport: RTP/AVP/UDP;unicast;client_port=$rtpPort\r\n\r\n"
+                "Transport: RTP/AVP/UDP;unicast;client_port=$rtpPort-${rtpPort + 1}\r\n\r\n"
         )
     }
 
