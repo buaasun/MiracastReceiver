@@ -36,37 +36,12 @@ class MiracastVideoRenderer(private val surfaceProvider: () -> Surface?) {
         }
     }
 
-    // ─── 诊断计数器 ──────────────────────────────────────────────────────
-    // 「RTP 收包正常但画面不动」时，必须能区分卡在：没访问单元 / 没 SPS-PPS /
-    // 没关键帧 / 解码器没送显。原实现这些状态只在首次打印，现场根本看不到。
-    private var statUnits = 0L
-    private var statDecoded = 0L
-    private var statDroppedNoSurface = 0L
-    private var statDroppedNoConfig = 0L
-    private var statDroppedNoIdr = 0L
-    private var statLastReport = System.currentTimeMillis()
-
-    private fun reportStats() {
-        val now = System.currentTimeMillis()
-        if (now - statLastReport < 1000) return
-        statLastReport = now
-        Timber.i(
-            "Miracast video stats: units=$statUnits decoded=$statDecoded " +
-                "noSurface=$statDroppedNoSurface noConfig=$statDroppedNoConfig " +
-                "noIdr=$statDroppedNoIdr hasSps=${sps != null} hasPps=${pps != null} " +
-                "decoder=${decoder != null} awaitingKeyframe=$awaitingKeyframe"
-        )
-    }
-
     /** [TsDemuxer] 的回调入口。 */
     fun onAccessUnit(unit: ByteArray, ptsUs: Long) {
-        statUnits++
         captureParameterSets(unit)
-        reportStats()
 
         val surface = surfaceProvider()
         if (surface == null || !surface.isValid) {
-            statDroppedNoSurface++
             releaseDecoder()
             return
         }
@@ -82,22 +57,20 @@ class MiracastVideoRenderer(private val surfaceProvider: () -> Surface?) {
         if (decoder == null || surface !== configuredSurface) {
             if (!rebuildDecoder(surface)) {
                 droppedBeforeConfig++
-                statDroppedNoConfig++
+                if (droppedBeforeConfig % 60 == 0) {
+                    Timber.d("Miracast: waiting for SPS/PPS, dropped $droppedBeforeConfig units")
+                }
                 return
             }
         }
 
         // 新解码器必须从 IDR 开始，否则解出来是花的
         if (awaitingKeyframe) {
-            if (!containsIdr(unit)) {
-                statDroppedNoIdr++
-                return
-            }
+            if (!containsIdr(unit)) return
             awaitingKeyframe = false
             Timber.i("Miracast: keyframe found, decoding started")
         }
 
-        statDecoded++
         decoder?.decodeNalUnit(unit, ptsUs)
     }
 
