@@ -121,6 +121,9 @@ class WfdSessionHandler(
         return msg
     }
 
+    /** 保护 [send]：解码线程会主动请求 IDR，与读循环的响应写并发。 */
+    private val sendLock = Any()
+
     private fun send(msg: String) {
         Timber.d("WFD << ${msg.lineSequence().first()}")
         Timber.v("WFD << full:\n$msg")
@@ -257,6 +260,39 @@ class WfdSessionHandler(
                 "CSeq: ${++outCseq}\r\n" +
                 "Session: $sessionId\r\n\r\n"
         )
+    }
+
+    /**
+     * 请求 Source 立刻发一个 IDR（WFD 规范里的 M-feedback 机制）。
+     *
+     * 解码器重建后必须从 IDR 开始解，否则只能等 Source 的下一个自然 GOP —— 实测 Windows
+     * 的 GOP 约 2~3 秒，期间画面完全静止。主动要一个能把这个恢复窗口压到几百毫秒。
+     *
+     * 从接收线程调用（不是 RTSP 读循环所在的线程），[send] 不是线程安全的，
+     * 所以这里显式加锁，且失败只记日志不抛 —— 拿不到 IDR 只是慢一点，不该影响会话。
+     *
+     * @return true 表示请求已写入 socket（不代表 Source 真的会响应该参数）
+     */
+    fun requestIdr(): Boolean {
+        if (sessionId.isEmpty()) return false
+        return try {
+            synchronized(sendLock) {
+                val body = "wfd_idr_request\r\n"
+                send(
+                    "SET_PARAMETER $presentationUrl RTSP/1.0\r\n" +
+                        "CSeq: ${++outCseq}\r\n" +
+                        "Session: $sessionId\r\n" +
+                        "Content-Type: text/parameters\r\n" +
+                        "Content-Length: ${body.toByteArray(StandardCharsets.UTF_8).size}\r\n\r\n" +
+                        body
+                )
+            }
+            Timber.i("WFD: requested IDR from source")
+            true
+        } catch (e: Exception) {
+            Timber.w("WFD: IDR request failed (${e.message})")
+            false
+        }
     }
 
     // ─── 响应构造 ───────────────────────────────────────────────────────────

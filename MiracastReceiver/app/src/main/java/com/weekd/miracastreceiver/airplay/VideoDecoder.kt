@@ -63,6 +63,27 @@ class VideoDecoder(private val outputSurface: Surface) {
     private var outputRunning = false
 
     /**
+     * 最近一次成功送显的时间（[android.os.SystemClock.elapsedRealtime]）。
+     *
+     * 用来看门狗判活：这台电视的硬解（OMX.amlogic.avc.decoder.awesome）在收到大量
+     * 不连续的码流后会内部死锁 —— 输出端不再归还 buffer，输入端 16 个缓冲区全占满，
+     * 于是每帧都 `dequeueInputBuffer` 返回 -1 被丢掉。它**不会**抛 IllegalStateException，
+     * 所以 [isHealthy] 一直是 true，没人会去重建它，画面就永久冻住。
+     * 只能靠「多久没吐出帧」来发现。
+     */
+    @Volatile
+    private var lastOutputAt = 0L
+
+    /** 初始化完成的时刻，作为 [isStalled] 在第一帧到达前的判活基准。 */
+    @Volatile
+    private var initializedAt = 0L
+
+    /** 累计送显帧数，供上层诊断/看门狗使用。 */
+    @Volatile
+    var outputFrameCount = 0L
+        private set
+
+    /**
      * Initializes the MediaCodec decoder with the video stream parameters from the SDP.
      *
      * This must be called ONCE before any calls to [decodeNalUnit].
@@ -144,6 +165,9 @@ class VideoDecoder(private val outputSurface: Surface) {
         mediaCodec!!.configure(format, outputSurface, null, 0)
         mediaCodec!!.start()
 
+        initializedAt = android.os.SystemClock.elapsedRealtime()
+        lastOutputAt = 0L
+        outputFrameCount = 0L
         isInitialized = true
         startOutputThread()
         Logger.i("H.264 decoder initialized successfully")
@@ -160,7 +184,11 @@ class VideoDecoder(private val outputSurface: Surface) {
                     // 阻塞等待而不是轮询：解码器一有输出就立刻返回，延迟最低
                     val index = codec.dequeueOutputBuffer(bufferInfo, OUTPUT_BUFFER_TIMEOUT_US)
                     when {
-                        index >= 0 -> codec.releaseOutputBuffer(index, true)
+                        index >= 0 -> {
+                            lastOutputAt = android.os.SystemClock.elapsedRealtime()
+                            outputFrameCount++
+                            codec.releaseOutputBuffer(index, true)
+                        }
                         index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ->
                             publishOutputSize(codec.outputFormat)
                         // INFO_TRY_AGAIN_LATER：超时无输出，继续等
@@ -294,6 +322,20 @@ class VideoDecoder(private val outputSurface: Surface) {
         }
     }
 
+    /**
+     * 解码器是否已经「卡死」—— 还在初始化状态，但超过 [STALL_TIMEOUT_MS] 没吐出任何一帧。
+     *
+     * 判活必须用「输出」而不是「输入」：卡死时输入侧仍在正常收包（只是每帧都被丢弃），
+     * 只有输出端是真正停摆的。调用方看到 true 应当 [release] 并重建解码器。
+     *
+     * 刚初始化时 [lastOutputAt] 为 0，此时用初始化时刻兜底，避免还没解出第一帧就被误判。
+     */
+    fun isStalled(): Boolean {
+        if (!isInitialized || mediaCodec == null) return false
+        val last = lastOutputAt.takeIf { it > 0 } ?: initializedAt
+        return android.os.SystemClock.elapsedRealtime() - last > STALL_TIMEOUT_MS
+    }
+
     fun release() {
         Logger.d("Releasing VideoDecoder")
 
@@ -334,6 +376,15 @@ class VideoDecoder(private val outputSurface: Surface) {
         // 进而丢包 → 等关键帧 → 画面冻结数秒。解码器拿不到空缓冲区说明它已满负荷，
         // 再等只会加剧上游积压，不如直接丢掉这一帧。
         private const val INPUT_BUFFER_TIMEOUT_US = 5_000L
+
+        /**
+         * 多久没吐出帧就判定解码器卡死（毫秒）。
+         *
+         * 取 800ms：正常 60fps 下每 16ms 就该出一帧，静止画面下 Source 仍会持续发 P 帧
+         * （码率约 2Mbps，实测 229 包/秒），所以 800ms 无输出一定是卡死而不是「没画面」。
+         * 留足余量是为了避开开机首个 IDR 之前的空窗和偶发 GC 抖动。
+         */
+        const val STALL_TIMEOUT_MS = 800L
 
         /**
          * Parses the H.264 SPS NAL unit to extract the actual video resolution.

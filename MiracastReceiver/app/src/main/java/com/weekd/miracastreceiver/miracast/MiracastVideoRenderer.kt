@@ -17,7 +17,11 @@ import timber.log.Timber
  *
  * @param surfaceProvider 取当前可用的 Surface；应用切后台时会返回 null
  */
-class MiracastVideoRenderer(private val surfaceProvider: () -> Surface?) {
+class MiracastVideoRenderer(
+    private val surfaceProvider: () -> Surface?,
+    /** 重建解码器后向 Source 要一个 IDR，避免干等 2~3 秒的自然 GOP。 */
+    private val idrRequester: () -> Unit = {}
+) {
 
     private var decoder: VideoDecoder? = null
     private var configuredSurface: Surface? = null
@@ -25,6 +29,9 @@ class MiracastVideoRenderer(private val surfaceProvider: () -> Surface?) {
     private var pps: ByteArray? = null
     private var awaitingKeyframe = true
     private var droppedBeforeConfig = 0
+
+    /** 自上次健康检查以来的不连续次数，用于诊断时区分「偶发抖动」和「链路持续丢包」。 */
+    private var discontinuitiesSinceHealthCheck = 0
 
     /**
      * 数据有丢失时调用。
@@ -39,6 +46,13 @@ class MiracastVideoRenderer(private val surfaceProvider: () -> Surface?) {
      */
     fun onDiscontinuity() {
         if (BuildConfig.DEBUG) statDiscontinuities++
+        // 真丢包（TS continuity gap）意味着当前 GOP 的参考链断了，后续 P 帧解出来必然花屏。
+        // 但「等下一个 IDR」代价太高：Windows 的 GOP 约 2~3 秒，期间完全静止。
+        //
+        // 折中：让 MediaCodec 自己错误隐藏 —— 它能撑过个别缺失的参考帧，画质略降但不冻结。
+        // 真正撑不住时的表现是「输出停摆而不抛异常」，由 isStalled() 看门狗兜底重建。
+        // 这样偶发丢包只花屏一瞬，积重难返时才重建（代价是一个 GOP）。
+        discontinuitiesSinceHealthCheck++
     }
 
     // ─── 诊断计数器（仅 debug 构建，release 会被编译掉）────────────────────
@@ -48,16 +62,29 @@ class MiracastVideoRenderer(private val surfaceProvider: () -> Surface?) {
     private var statDroppedNoConfig = 0L
     private var statDroppedNoIdr = 0L
     private var statDiscontinuities = 0L
+    private var statDecoderStalls = 0L
+    /** 累计真正送显的帧数（跨解码器重建累加）—— 这才是「屏幕上有没有动」的证据。 */
+    private var statOutputFrames = 0L
+    private var statLastDecoderFrames = 0L
     private var statLastReport = System.currentTimeMillis()
 
     private fun reportStats() {
         val now = System.currentTimeMillis()
         if (now - statLastReport < 1000) return
         statLastReport = now
+
+        // 从当前解码器取增量，累加进跨重建的总数。重建会让 outputFrameCount 归零，
+        // 直接读它会把总数算丢。
+        decoder?.let { d ->
+            val current = d.outputFrameCount
+            if (current >= statLastDecoderFrames) statOutputFrames += current - statLastDecoderFrames
+            statLastDecoderFrames = current
+        }
         Timber.i(
             "Miracast video stats: units=$statUnits decoded=$statDecoded " +
                 "noSurface=$statDroppedNoSurface noConfig=$statDroppedNoConfig " +
-                "noIdr=$statDroppedNoIdr disc=$statDiscontinuities hasSps=${sps != null} hasPps=${pps != null} " +
+                "noIdr=$statDroppedNoIdr disc=$statDiscontinuities stalls=$statDecoderStalls " +
+                "out=$statOutputFrames hasSps=${sps != null} hasPps=${pps != null} " +
                 "decoder=${decoder != null} awaitingKeyframe=$awaitingKeyframe"
         )
     }
@@ -80,6 +107,20 @@ class MiracastVideoRenderer(private val surfaceProvider: () -> Surface?) {
             Timber.i("Miracast: surface changed — switched decoder output in place")
             configuredSurface = surface
         }
+
+        // 解码器卡死检测：这台电视的硬解在码流不连续后会内部死锁 —— 输出端不再吐帧，
+        // 输入端缓冲区全占满，每帧都丢。它不抛异常，isHealthy 一直是 true，所以只能靠
+        // 「多久没出帧」发现。重建后从下一个 IDR 恢复（GOP 约 2~3 秒）。
+        val stalled = current?.isStalled() == true
+        if (stalled) {
+            Timber.w(
+                "Miracast: decoder stalled (no frame for ${VideoDecoder.STALL_TIMEOUT_MS}ms, " +
+                    "disc=$discontinuitiesSinceHealthCheck since last check) — recreating"
+            )
+            if (BuildConfig.DEBUG) statDecoderStalls++
+            releaseDecoder()
+        }
+        discontinuitiesSinceHealthCheck = 0
 
         // Surface 变了（应用切后台再回前台会换新的）就重建解码器，否则画面会一直黑
         if (decoder == null || surface !== configuredSurface) {
@@ -115,8 +156,12 @@ class MiracastVideoRenderer(private val surfaceProvider: () -> Surface?) {
         val (width, height) = VideoDecoder.parseSpsResolution(spsBytes) ?: (1920 to 1080)
         decoder = VideoDecoder(surface).also { it.initialize(spsBytes, ppsBytes, width, height) }
         configuredSurface = surface
+        statLastDecoderFrames = 0L
         awaitingKeyframe = true
         Timber.i("Miracast decoder initialized: ${width}x$height")
+        // 干等自然 GOP 要 2~3 秒，主动要一个 IDR 通常几百毫秒就到。
+        // 放在重建之后：此时 awaitingKeyframe 已置位，收到的第一帧若是 IDR 立刻开始解码。
+        idrRequester()
         return true
     }
 

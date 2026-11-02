@@ -28,7 +28,12 @@ import java.net.DatagramSocket
 class RtpReceiver(
     private val context: Context,
     private val port: Int,
-    private val surfaceProvider: () -> Surface?
+    private val surfaceProvider: () -> Surface?,
+    /**
+     * 向 Source 请求一个 IDR。解码器重建后调用：没有它要等 Source 下一个自然 GOP
+     * （实测 Windows 约 2~3 秒），有了通常几百毫秒内就恢复画面。
+     */
+    private val idrRequester: () -> Unit = {}
 ) {
 
     private var socket: DatagramSocket? = null
@@ -39,7 +44,7 @@ class RtpReceiver(
     @Volatile
     private var isRunning = false
 
-    private val renderer = MiracastVideoRenderer(surfaceProvider)
+    private val renderer = MiracastVideoRenderer(surfaceProvider, idrRequester)
     private val audioPlayer = MiracastAudioPlayer()
     private val demuxer = TsDemuxer(
         onAccessUnit = renderer::onAccessUnit,
