@@ -39,7 +39,26 @@ class TsDemuxer(
     private var audioPid = -1
     private var audioCodec = AudioCodec.AAC_ADTS
 
-    private val videoPes = PesAssembler("video") { data, pts -> onAccessUnit(data, pts) }
+    // ─── 诊断计数器（仅 debug 构建）────────────────────────────────────────
+    // BuildConfig.DEBUG 是编译期常量，release 构建时下面整个分支会被消除，
+    // 运行时零开销、字节码里也不存在。
+    //
+    // 声明必须排在 videoPes 之前：那几个 lambda 会引用这些字段，写在后面虽然
+    // Kotlin 允许（延迟求值），但初始化顺序不清不楚，改的时候容易踩空。
+    private var statTsPackets = 0L
+    private var statSyncLost = 0L
+    private var statNullPkts = 0L
+    private var statPatSeen = 0L
+    private var statPmtSeen = 0L
+    private var statVideoPkts = 0L
+    private var statVideoPes = 0L
+    private var statAudioPkts = 0L
+    private var statLastReport = System.currentTimeMillis()
+
+    private val videoPes = PesAssembler("video") { data, pts ->
+        if (BuildConfig.DEBUG) statVideoPes++
+        onAccessUnit(data, pts)
+    }
     private val audioPes = PesAssembler("audio") { data, _ -> onAudioPes(audioCodec, data) }
 
     companion object {
@@ -50,19 +69,6 @@ class TsDemuxer(
         private const val STREAM_TYPE_AAC_ADTS = 0x0F
         private const val STREAM_TYPE_LPCM = 0x83    // WFD 规范里 LPCM 用 private stream 0x83
     }
-
-    // ─── 诊断计数器（仅 debug 构建）────────────────────────────────────────
-    // BuildConfig.DEBUG 是编译期常量，release 构建时下面整个分支会被消除，
-    // 运行时零开销、字节码里也不存在。
-    private var statTsPackets = 0L
-    private var statSyncLost = 0L
-    private var statNullPkts = 0L
-    private var statPatSeen = 0L
-    private var statPmtSeen = 0L
-    private var statVideoPkts = 0L
-    private var statVideoPes = 0L
-    private var statAudioPkts = 0L
-    private var statLastReport = System.currentTimeMillis()
 
     /** 喂入一段 TS 数据（必须是 188 字节包对齐的，RTP 负载天然满足）。 */
     fun feed(data: ByteArray, offset: Int, length: Int) {
