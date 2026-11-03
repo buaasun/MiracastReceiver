@@ -58,6 +58,10 @@ class CastReceiverService : Service() {
     private lateinit var upnpHttpServer: UpnpHttpServer
     private lateinit var wfdServer: WfdServer
     private lateinit var wifiDirectManager: WifiDirectManager
+
+    /** 仅 debug 构建：Windows 发起配对后 2 秒自动点「接受」。 */
+    private val p2pAutoAccept: com.weekd.miracastreceiver.miracast.P2pAutoAccept? =
+        if (com.weekd.miracastreceiver.BuildConfig.DEBUG) com.weekd.miracastreceiver.miracast.P2pAutoAccept() else null
     /** startAllServices() 已执行；防止重复 onStartCommand 再建一套接收器。 */
     private var servicesStarted = false
     private lateinit var deviceUuid: String
@@ -432,6 +436,7 @@ class CastReceiverService : Service() {
         // 启动 Windows 无线显示器（Miracast/WFD）
         // 先建 P2P 组，再注入 WFD IE —— 顺序反了的话建组会覆盖掉刚设的 IE。
         wifiDirectManager.start()
+        p2pAutoAccept?.start()
         if (WfdRootHelper.advertiseSink(this)) {
             Timber.i("Miracast: 已作为 Wi-Fi Display Sink 对外广播，Windows 可发现")
         } else {
@@ -488,6 +493,7 @@ class CastReceiverService : Service() {
     private fun shutdownMiracast() {
         runCatching { wfdServer.stop() }
         runCatching { WfdRootHelper.stopAdvertising(this) }
+        runCatching { p2pAutoAccept?.stop() }
         runCatching { wifiDirectManager.stop() }
     }
 
