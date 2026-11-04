@@ -65,6 +65,34 @@ public class RenderProbeCaptureTest {
         assertTrue("All capture files fit the configured budget", total <= BUDGET);
     }
 
+    @Test public void delayedWindowSkipsEarlyInputsAndFinishesAtDelayPlusDuration() throws Exception {
+        AtomicLong clock = new AtomicLong(100);
+        QueuedInputCapture capture = new QueuedInputCapture(Files.createTempDirectory("delayed").toFile(),
+                "delayed", "codec", 8000, 30000, BUDGET, 16, new byte[0], new byte[0],
+                clock::get, FileOutputStream::new);
+        try {
+            assertFalse(capture.record(new byte[]{1}, 1, clock.get()));
+            clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(29999));
+            assertFalse(capture.record(new byte[]{2}, 2, clock.get()));
+            assertEquals(0, new File(capture.directory(), "payload.h264").length());
+            assertFalse(capture.awaitFinished(80));
+            clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(1));
+            assertTrue(capture.record(new byte[]{3}, 3, clock.get()));
+            clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(7999));
+            assertTrue(capture.record(new byte[]{4}, 4, clock.get()));
+            clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(1));
+            assertTrue(capture.awaitFinished(2000)); // No more input and no session close.
+            assertFalse(capture.record(new byte[]{5}, 5, clock.get()));
+            assertArrayEquals(new byte[]{3, 4}, Files.readAllBytes(
+                    new File(capture.directory(), "payload.h264").toPath()));
+            Properties summary = summary(capture.directory());
+            assertEquals("true", summary.getProperty("complete"));
+            assertEquals("30000", summary.getProperty("delay_ms"));
+            assertEquals("2", summary.getProperty("delayed_records"));
+            assertEquals("2", summary.getProperty("written_records"));
+        } finally { capture.close(); }
+    }
+
     @Test public void slowDiskDoesNotBlockProducerAndOverflowIsExplicit() throws Exception {
         CountDownLatch entered = new CountDownLatch(1), unblock = new CountDownLatch(1);
         QueuedInputCapture.OutputFactory output = file -> {

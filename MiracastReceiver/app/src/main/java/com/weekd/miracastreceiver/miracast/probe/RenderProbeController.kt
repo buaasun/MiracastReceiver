@@ -22,7 +22,7 @@ class RenderProbeController private constructor(
             return try {
                 val config = RenderProbeConfig.load(File(context.filesDir, "render-probe.properties"))
                 Logger.i("Render probe settings: codec=${config.codec} captureSeconds=${config.captureSeconds} " +
-                    "maxTotalBytes=${config.captureMaxBytes} label=${config.label}")
+                    "delaySeconds=${config.captureDelaySeconds} maxTotalBytes=${config.captureMaxBytes} label=${config.label}")
                 RenderProbeController(context.filesDir, config)
             } catch (e: Exception) {
                 Logger.e("Invalid render-probe.properties; probe disabled", e)
@@ -42,7 +42,8 @@ class RenderProbeController private constructor(
         override fun onCodecStarted(actualCodecName: String, csd0: ByteArray, csd1: ByteArray) {
             if (closed) return
             capture = QueuedInputCapture(File(filesDir, "render-probe"), config.label, actualCodecName,
-                config.captureSeconds * 1000L, config.captureMaxBytes, 16, csd0, csd1)
+                config.captureSeconds * 1000L, config.captureDelaySeconds * 1000L,
+                config.captureMaxBytes, 16, csd0, csd1)
             Logger.i("Queued-input capture started: ${capture!!.directory().absolutePath}; " +
                 "payload=successful queue bytes only, CSD stored separately")
         }

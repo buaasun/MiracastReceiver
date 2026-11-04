@@ -16,7 +16,7 @@ public final class QueuedInputCapture implements Closeable {
     private final Object lock = new Object();
     private final File directory;
     private final String codecName;
-    private final long durationNs, maxBytes, startMonoNs, startWallMs;
+    private final long durationNs, delayNs, maxBytes, startMonoNs, startWallMs;
     private final Clock clock;
     private final OutputFactory outputs;
     private final ArrayBlockingQueue<Input> queue;
@@ -24,7 +24,7 @@ public final class QueuedInputCapture implements Closeable {
     private final Thread worker;
     private boolean accepting = true;
     private String endReason = "running", error = "";
-    private long acceptedRecords, acceptedBytes, writtenRecords, writtenBytes, droppedRecords;
+    private long acceptedRecords, acceptedBytes, writtenRecords, writtenBytes, droppedRecords, delayedRecords;
     private long reservedBytes;
     private long firstPtsUs = -1, lastPtsUs = -1, firstQueuedNs = -1, lastQueuedNs = -1;
 
@@ -34,10 +34,22 @@ public final class QueuedInputCapture implements Closeable {
                 System::nanoTime, FileOutputStream::new);
     }
 
+    public QueuedInputCapture(File root, String label, String codecName, long durationMs,
+            long delayMs, long maxBytes, int queueCapacity, byte[] csd0, byte[] csd1) throws IOException {
+        this(root, label, codecName, durationMs, delayMs, maxBytes, queueCapacity, csd0, csd1,
+                System::nanoTime, FileOutputStream::new);
+    }
+
     QueuedInputCapture(File root, String label, String codecName, long durationMs,
             long maxBytes, int queueCapacity, byte[] csd0, byte[] csd1, Clock clock,
             OutputFactory outputs) throws IOException {
-        if (durationMs <= 0 || durationMs > 8000 || maxBytes < 65536 ||
+        this(root, label, codecName, durationMs, 0L, maxBytes, queueCapacity, csd0, csd1, clock, outputs);
+    }
+
+    QueuedInputCapture(File root, String label, String codecName, long durationMs,
+            long delayMs, long maxBytes, int queueCapacity, byte[] csd0, byte[] csd1, Clock clock,
+            OutputFactory outputs) throws IOException {
+        if (durationMs <= 0 || durationMs > 8000 || delayMs < 0 || delayMs > 60000 || maxBytes < 65536 ||
                 maxBytes > 16L * 1024 * 1024 || queueCapacity < 1 || queueCapacity > 16) {
             throw new IllegalArgumentException("Invalid bounded capture settings");
         }
@@ -48,6 +60,7 @@ public final class QueuedInputCapture implements Closeable {
         if (reservedBytes >= maxBytes) throw new IllegalArgumentException("Capture budget too small for CSD");
         this.codecName = codecName.length() > 128 ? codecName.substring(0, 128) : codecName;
         this.durationNs = TimeUnit.MILLISECONDS.toNanos(durationMs);
+        this.delayNs = TimeUnit.MILLISECONDS.toNanos(delayMs);
         this.maxBytes = maxBytes;
         this.clock = clock;
         this.outputs = outputs;
@@ -68,6 +81,10 @@ public final class QueuedInputCapture implements Closeable {
         synchronized (lock) {
             expireIfDue();
             if (!accepting) return false;
+            if (clock.nanoTime() - startMonoNs < delayNs) {
+                delayedRecords++;
+                return false;
+            }
             String row = (acceptedRecords + 1) + "\t" + acceptedBytes + "\t" + data.length +
                     "\t" + ptsUs + "\t" + queuedMonoNs + "\n";
             byte[] index = row.getBytes(StandardCharsets.UTF_8);
@@ -113,7 +130,7 @@ public final class QueuedInputCapture implements Closeable {
     }
 
     private void expireIfDue() {
-        if (accepting && clock.nanoTime() - startMonoNs >= durationNs) {
+        if (accepting && clock.nanoTime() - startMonoNs >= delayNs + durationNs) {
             finish(acceptedRecords == 0 ? "duration_no_input" : "duration_elapsed");
         }
     }
@@ -170,6 +187,7 @@ public final class QueuedInputCapture implements Closeable {
             summary.setProperty("accepted_records", String.valueOf(acceptedRecords));
             summary.setProperty("written_records", String.valueOf(writtenRecords));
             summary.setProperty("dropped_records", String.valueOf(droppedRecords));
+            summary.setProperty("delayed_records", String.valueOf(delayedRecords));
             summary.setProperty("accepted_payload_bytes", String.valueOf(acceptedBytes));
             summary.setProperty("written_payload_bytes", String.valueOf(writtenBytes));
             summary.setProperty("max_total_bytes", String.valueOf(maxBytes));
@@ -177,6 +195,9 @@ public final class QueuedInputCapture implements Closeable {
             summary.setProperty("started_mono_ns", String.valueOf(startMonoNs));
             summary.setProperty("finished_mono_ns", String.valueOf(clock.nanoTime()));
             summary.setProperty("duration_ms", String.valueOf(TimeUnit.NANOSECONDS.toMillis(durationNs)));
+            summary.setProperty("delay_ms", String.valueOf(TimeUnit.NANOSECONDS.toMillis(delayNs)));
+            summary.setProperty("window_start_mono_ns", String.valueOf(startMonoNs + delayNs));
+            summary.setProperty("window_end_mono_ns", String.valueOf(startMonoNs + delayNs + durationNs));
             summary.setProperty("first_pts_us", String.valueOf(firstPtsUs));
             summary.setProperty("last_pts_us", String.valueOf(lastPtsUs));
             summary.setProperty("first_queued_mono_ns", String.valueOf(firstQueuedNs));

@@ -7,12 +7,14 @@ import java.util.Properties;
 public final class RenderProbeConfig {
     public final String codec;
     public final int captureSeconds;
+    public final int captureDelaySeconds;
     public final long captureMaxBytes;
     public final String label;
 
-    private RenderProbeConfig(String codec, int seconds, long maxBytes, String label) {
+    private RenderProbeConfig(String codec, int seconds, int delaySeconds, long maxBytes, String label) {
         this.codec = codec;
         this.captureSeconds = seconds;
+        this.captureDelaySeconds = delaySeconds;
         this.captureMaxBytes = maxBytes;
         this.label = label;
     }
@@ -23,8 +25,10 @@ public final class RenderProbeConfig {
             throw new IllegalArgumentException("codec must be auto or software");
         }
         long seconds = Long.parseLong(properties.getProperty("capture_seconds", "0").trim());
+        long delaySeconds = Long.parseLong(properties.getProperty("capture_delay_seconds", "0").trim());
         long maxBytes = Long.parseLong(properties.getProperty("capture_max_bytes", "16777216").trim());
         return new RenderProbeConfig(codec, (int) Math.max(0, Math.min(8, seconds)),
+                (int) Math.max(0, Math.min(60, delaySeconds)),
                 Math.max(65536, Math.min(16L * 1024 * 1024, maxBytes)),
                 safeLabel(properties.getProperty("label", "probe")));
     }
