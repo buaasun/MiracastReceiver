@@ -3,6 +3,7 @@ package com.weekd.miracastreceiver.miracast
 import android.view.Surface
 import com.weekd.miracastreceiver.BuildConfig
 import com.weekd.miracastreceiver.airplay.VideoDecoder
+import com.weekd.miracastreceiver.miracast.probe.RenderProbeController
 import timber.log.Timber
 
 /**
@@ -24,7 +25,8 @@ private const val MAX_REBUILD_BACKOFF_MS = 10_000L
 class MiracastVideoRenderer(
     private val surfaceProvider: () -> Surface?,
     /** 重建解码器后向 Source 要一个 IDR，避免干等 2~3 秒的自然 GOP。 */
-    private val idrRequester: () -> Unit = {}
+    private val idrRequester: () -> Unit = {},
+    private val renderProbe: RenderProbeController? = null
 ) {
 
     private var decoder: VideoDecoder? = null
@@ -201,7 +203,14 @@ class MiracastVideoRenderer(
 
         releaseDecoder()
         val (width, height) = VideoDecoder.parseSpsResolution(spsBytes) ?: (1920 to 1080)
-        decoder = VideoDecoder(surface).also { it.initialize(spsBytes, ppsBytes, width, height) }
+        val next = VideoDecoder(surface, renderProbe?.codecName, renderProbe?.newQueueObserver())
+        try {
+            next.initialize(spsBytes, ppsBytes, width, height)
+        } catch (e: Exception) {
+            next.release()
+            throw e
+        }
+        decoder = next
         configuredSurface = surface
         statLastDecoderFrames = 0L
         statLastDecoderCallbacks = 0L

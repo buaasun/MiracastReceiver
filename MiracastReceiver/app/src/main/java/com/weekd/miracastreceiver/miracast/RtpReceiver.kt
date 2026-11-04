@@ -3,6 +3,7 @@ package com.weekd.miracastreceiver.miracast
 import android.content.Context
 import android.view.Surface
 import com.weekd.miracastreceiver.BuildConfig
+import com.weekd.miracastreceiver.miracast.probe.RenderProbeController
 import kotlinx.coroutines.*
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -44,7 +45,7 @@ class RtpReceiver(
     @Volatile
     private var isRunning = false
 
-    private val renderer = MiracastVideoRenderer(surfaceProvider, idrRequester)
+    private val renderer = MiracastVideoRenderer(surfaceProvider, idrRequester, RenderProbeController.load(context))
     private val audioPlayer = MiracastAudioPlayer()
     private val demuxer = TsDemuxer(
         onAccessUnit = renderer::onAccessUnit,

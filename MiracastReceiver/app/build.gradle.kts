@@ -27,6 +27,7 @@ android {
         targetSdk = 36
         versionCode = 14
         versionName = if (renderClockProbe) "1.2.9-renderprobe" else "1.2.9"
+        buildConfigField("boolean", "RENDER_CLOCK_PROBE", "false")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -47,7 +48,11 @@ android {
     }
 
     buildTypes {
+        debug {
+            buildConfigField("boolean", "RENDER_CLOCK_PROBE", renderClockProbe.toString())
+        }
         release {
+            buildConfigField("boolean", "RENDER_CLOCK_PROBE", "false")
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),

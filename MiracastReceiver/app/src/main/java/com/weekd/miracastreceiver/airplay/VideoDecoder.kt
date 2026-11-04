@@ -31,7 +31,18 @@ import com.weekd.miracastreceiver.util.Logger
  *   decoder.decodeNalUnit(nalUnitBytes)                    // call for each video chunk
  *   decoder.release()                                       // call when done
  */
-class VideoDecoder(private val outputSurface: Surface) {
+class VideoDecoder(
+    private val outputSurface: Surface,
+    private val codecName: String? = null,
+    private val queuedInputObserver: QueuedInputObserver? = null
+) {
+
+    /** Optional test-build hook. Bytes are observed only after queueInputBuffer succeeds. */
+    interface QueuedInputObserver {
+        fun onCodecStarted(actualCodecName: String, csd0: ByteArray, csd1: ByteArray)
+        fun onQueuedInput(bytes: ByteArray, presentationTimeUs: Long, queuedMonoNs: Long)
+        fun close()
+    }
 
     // The underlying hardware decoder — null until initialize() is called
     private var mediaCodec: MediaCodec? = null
@@ -270,7 +281,17 @@ class VideoDecoder(private val outputSurface: Surface) {
         // Create the hardware H.264 decoder.
         // "video/avc" is the MIME type for H.264. Android will pick the best
         // available hardware decoder for this format.
-        mediaCodec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        mediaCodec = if (codecName == null) {
+            MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        } else {
+            try {
+                MediaCodec.createByCodecName(codecName)
+            } catch (e: Exception) {
+                Logger.e("Explicit H.264 codec '$codecName' could not be created; no fallback", e)
+                throw e
+            }
+        }
+        Logger.i("H.264 codec selected: actual=${mediaCodec!!.name} requested=${codecName ?: "auto"}")
 
         // Configure the decoder:
         // - format: what the input will look like (H.264, width, height, SPS/PPS)
@@ -280,6 +301,11 @@ class VideoDecoder(private val outputSurface: Surface) {
         mediaCodec!!.configure(format, outputSurface, null, 0)
         mediaCodec!!.start()
         startFrameRenderCallbacks(mediaCodec!!)
+        try {
+            queuedInputObserver?.onCodecStarted(mediaCodec!!.name, spsBytes, ppsBytes)
+        } catch (e: Exception) {
+            Logger.e("Queued-input probe could not start (decoder remains active)", e)
+        }
 
         initializedAt = android.os.SystemClock.elapsedRealtime()
         lastOutputAt = 0L
@@ -381,6 +407,12 @@ class VideoDecoder(private val outputSurface: Surface) {
                     presentationTimeUs,
                     0                  // flags: 0 = normal frame (not end-of-stream)
                 )
+                // nalUnit is precisely the byte range just queued above; never capture failed attempts.
+                try {
+                    queuedInputObserver?.onQueuedInput(nalUnit, presentationTimeUs, System.nanoTime())
+                } catch (e: Exception) {
+                    Logger.e("Queued-input probe failed (decoder remains active)", e)
+                }
                 // 只有真正排进去的帧才算「解码器被喂了数据」，看门狗据此判断卡死。
                 if (inputsSinceLastOutput == 0) {
                     pendingSinceAt = android.os.SystemClock.elapsedRealtime()
@@ -495,6 +527,8 @@ class VideoDecoder(private val outputSurface: Surface) {
         val codec = mediaCodec
         mediaCodec = null
         isInitialized = false
+        runCatching { queuedInputObserver?.close() }
+            .onFailure { Logger.e("Queued-input probe did not flush completely", it) }
 
         // 输出线程没退出说明它卡在 native dequeueOutputBuffer 里 —— 这正是解码器死锁的
         // 典型表现。此时**绝不能** stop()/release()：那会在 native 层销毁它仍在使用的
@@ -512,10 +546,10 @@ class VideoDecoder(private val outputSurface: Surface) {
                     Logger.e("VideoDecoder: output thread never exited, leaking codec")
                     return@Thread
                 }
-                runCatching {
-                    codec?.stop()
-                    codec?.release()
-                }.onFailure { Logger.e("Deferred codec release failed", it) }
+                runCatching { codec?.stop() }
+                    .onFailure { Logger.e("Deferred codec stop failed", it) }
+                runCatching { codec?.release() }
+                    .onFailure { Logger.e("Deferred codec release failed", it) }
                 Logger.i("VideoDecoder: deferred codec teardown completed")
             }, "VideoDecoderReaper").apply {
                 isDaemon = true
@@ -524,12 +558,11 @@ class VideoDecoder(private val outputSurface: Surface) {
             return
         }
 
-        try {
-            codec?.stop()
-            codec?.release()
-        } catch (e: Exception) {
-            Logger.e("Error releasing MediaCodec (non-fatal)", e)
-        }
+        // 初始化失败时 codec 可能尚未进入 Executing，stop 会抛错；仍须释放已创建的实例。
+        runCatching { codec?.stop() }
+            .onFailure { Logger.e("Error stopping MediaCodec (non-fatal)", it) }
+        runCatching { codec?.release() }
+            .onFailure { Logger.e("Error releasing MediaCodec (non-fatal)", it) }
     }
 
     /** True if (w, h) look like a real video resolution — rejects parser garbage (e.g. 32x87392). */
