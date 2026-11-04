@@ -6,6 +6,11 @@ on:
     paths-ignore:
       - '**/*.md'
   workflow_dispatch:
+    inputs:
+      render_probe:
+        description: Build a separately installable render-clock hardware test
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -30,11 +35,25 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build Debug APK (ARM32)
+      - name: Unit tests and Debug APK (ARM32)
         working-directory: MiracastReceiver
+        env:
+          RENDER_PROBE: ${{ inputs.render_probe }}
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug -PbuildArm32 --no-daemon --stacktrace
+          extra=()
+          if [[ "$RENDER_PROBE" == "true" ]]; then
+            extra+=("-PrenderClockProbe=true")
+          fi
+          ./gradlew testDebugUnitTest assembleDebug -PbuildArm32 "${extra[@]}" --no-daemon --stacktrace
+
+      - name: Upload unit test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: miracast-unit-test-results
+          path: MiracastReceiver/app/build/test-results/testDebugUnitTest/*.xml
+          if-no-files-found: ignore
 
       - name: Upload ARM32 APK
         uses: actions/upload-artifact@v4

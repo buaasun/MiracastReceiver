@@ -3,6 +3,8 @@
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
 import android.view.Surface
 import com.weekd.miracastreceiver.util.Logger
 
@@ -63,7 +65,7 @@ class VideoDecoder(private val outputSurface: Surface) {
     private var outputRunning = false
 
     /**
-     * 最近一次成功送显的时间（[android.os.SystemClock.elapsedRealtime]）。
+     * 最近一次取到解码输出 buffer 的时间（[android.os.SystemClock.elapsedRealtime]）。
      *
      * 用来看门狗判活：这台电视的硬解（OMX.amlogic.avc.decoder.awesome）在收到大量
      * 不连续的码流后会内部死锁 —— 输出端不再归还 buffer，输入端 16 个缓冲区全占满，
@@ -98,10 +100,103 @@ class VideoDecoder(private val outputSurface: Surface) {
     @Volatile
     private var pendingSinceAt = 0L
 
-    /** 累计送显帧数，供上层诊断/看门狗使用。 */
+    /** 累计 dequeue 到的输出 buffer 数；不代表像素变化或物理屏幕已呈现。 */
     @Volatile
     var outputFrameCount = 0L
         private set
+
+    /** MediaCodec 的呈现回调诊断；回调不等于物理屏幕或截图像素更新。时间单位见字段名。 */
+    data class FrameRenderStats(
+        val supported: Boolean = false,
+        val callbackCount: Long = 0L,
+        val lastCallbackAgeMs: Long = -1L,
+        val callbackPresentationTimeUs: Long = -1L,
+        val callbackRenderTimeNs: Long = -1L,
+        val callbackSubmitTimeNs: Long = -1L,
+        val lastSubmitPresentationTimeUs: Long = -1L,
+        val lastSubmitTimeNs: Long = -1L
+    )
+
+    private val frameRenderLock = Any()
+    private var frameRenderStats = FrameRenderStats()
+    private var lastCallbackReceivedNs = 0L
+    private var frameRenderGeneration = 0L
+    private var diagnosticCodec: MediaCodec? = null
+    private var frameRenderThread: HandlerThread? = null
+    private val pendingSubmitTimes = LinkedHashMap<Long, Long>()
+
+    /** age 按本机收到回调的时刻计算；厂商可能批量回调，不等于物理呈现延迟。 */
+    fun frameRenderStats(): FrameRenderStats = synchronized(frameRenderLock) {
+        frameRenderStats.copy(lastCallbackAgeMs = if (lastCallbackReceivedNs == 0L) -1L
+            else (System.nanoTime() - lastCallbackReceivedNs).coerceAtLeast(0L) / 1_000_000L)
+    }
+
+    private fun startFrameRenderCallbacks(codec: MediaCodec) {
+        val generation = synchronized(frameRenderLock) {
+            diagnosticCodec = codec
+            frameRenderStats = FrameRenderStats()
+            lastCallbackReceivedNs = 0L
+            pendingSubmitTimes.clear()
+            ++frameRenderGeneration
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        val callbackThread = HandlerThread("VideoDecoderRenderCallbacks")
+        frameRenderThread = callbackThread
+        try {
+            callbackThread.start()
+            codec.setOnFrameRenderedListener({ callbackCodec, presentationTimeUs, nanoTime ->
+                synchronized(frameRenderLock) {
+                    if (generation == frameRenderGeneration && diagnosticCodec === callbackCodec) {
+                        lastCallbackReceivedNs = System.nanoTime()
+                        frameRenderStats = frameRenderStats.copy(
+                            callbackCount = frameRenderStats.callbackCount + 1L,
+                            callbackPresentationTimeUs = presentationTimeUs,
+                            callbackRenderTimeNs = nanoTime,
+                            callbackSubmitTimeNs = pendingSubmitTimes.remove(presentationTimeUs) ?: -1L
+                        )
+                    }
+                }
+            }, Handler(callbackThread.looper))
+            synchronized(frameRenderLock) {
+                frameRenderStats = frameRenderStats.copy(supported = true)
+            }
+        } catch (e: Exception) {
+            // 诊断能力不可用不能中断实时解码。
+            Logger.w("VideoDecoder: frame-render callback unavailable (${e.message})")
+            stopFrameRenderCallbacks()
+            synchronized(frameRenderLock) { diagnosticCodec = codec }
+        }
+    }
+
+    private fun recordOutputSubmission(codec: MediaCodec, ptsUs: Long, submitNs: Long) {
+        synchronized(frameRenderLock) {
+            if (diagnosticCodec !== codec) return
+            frameRenderStats = frameRenderStats.copy(
+                lastSubmitPresentationTimeUs = ptsUs, lastSubmitTimeNs = submitNs)
+            if (frameRenderStats.supported) {
+                // 重复 PTS 无法唯一配对，记为未知；队列有界，厂商不回调也不会持续积累。
+                pendingSubmitTimes[ptsUs] = if (pendingSubmitTimes.containsKey(ptsUs)) -1L else submitNs
+                if (pendingSubmitTimes.size > 128) {
+                    val oldest = pendingSubmitTimes.keys.iterator()
+                    oldest.next()
+                    oldest.remove()
+                }
+            }
+        }
+    }
+
+    private fun stopFrameRenderCallbacks() {
+        synchronized(frameRenderLock) {
+            ++frameRenderGeneration
+            diagnosticCodec = null
+            pendingSubmitTimes.clear()
+        }
+        frameRenderThread?.let { thread ->
+            thread.quit()
+            if (Thread.currentThread() !== thread) runCatching { thread.join(RELEASE_JOIN_MS) }
+        }
+        frameRenderThread = null
+    }
 
     /**
      * Initializes the MediaCodec decoder with the video stream parameters from the SDP.
@@ -184,6 +279,7 @@ class VideoDecoder(private val outputSurface: Surface) {
         // - flags: 0 (0 = decoder mode; CONFIGURE_FLAG_ENCODE would be for encoding)
         mediaCodec!!.configure(format, outputSurface, null, 0)
         mediaCodec!!.start()
+        startFrameRenderCallbacks(mediaCodec!!)
 
         initializedAt = android.os.SystemClock.elapsedRealtime()
         lastOutputAt = 0L
@@ -205,13 +301,17 @@ class VideoDecoder(private val outputSurface: Surface) {
                 try {
                     // 阻塞等待而不是轮询：解码器一有输出就立刻返回，延迟最低
                     val index = codec.dequeueOutputBuffer(bufferInfo, OUTPUT_BUFFER_TIMEOUT_US)
+                    if (!outputRunning) break
                     when {
                         index >= 0 -> {
                             lastOutputAt = android.os.SystemClock.elapsedRealtime()
                             outputFrameCount++
                             inputsSinceLastOutput = 0
                             pendingSinceAt = 0L
-                            codec.releaseOutputBuffer(index, true)
+                            // 实时镜像显式使用本机单调时钟，避免把发送端媒体 PTS 当作本机排程时刻。
+                            val submitNs = System.nanoTime()
+                            recordOutputSubmission(codec, bufferInfo.presentationTimeUs, submitNs)
+                            codec.releaseOutputBuffer(index, submitNs)
                         }
                         index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ->
                             publishOutputSize(codec.outputFormat)
@@ -302,7 +402,8 @@ class VideoDecoder(private val outputSurface: Surface) {
 
     /*
      * 送显策略（原 releaseOutputBuffers 的注释，逻辑已移入输出线程）：
-     * 一律 releaseOutputBuffer(index, true) 立即渲染，刻意**不**做定时送显来对齐音画 ——
+     * 一律 releaseOutputBuffer(index, System.nanoTime()) 按当前单调时钟提交，
+     * 不沿用媒体 PTS 排程，也不添加音画同步等待。
      * 这个 Surface 的 BufferQueue 只有约 3 帧，任何等待都会迅速反压到解码器，
      * 导致上游队列积压、延迟飙升并丢帧（丢帧即花屏）。
      * 音画对齐靠 AudioStreamServer 保持音频路径低延迟来实现。
@@ -375,6 +476,8 @@ class VideoDecoder(private val outputSurface: Surface) {
 
     fun release() {
         Logger.d("Releasing VideoDecoder")
+        // 先失效回调代次，再关闭 HandlerThread；旧 codec 的在途事件不能污染后续诊断。
+        stopFrameRenderCallbacks()
 
         // 必须先停掉输出线程并等它真正退出，再释放 codec。
         // 一边 dequeueOutputBuffer 一边 release 会在 native 层销毁仍在使用的互斥量，

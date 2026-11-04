@@ -10,17 +10,23 @@ val targetAbis = when {
     else -> listOf("arm64-v8a", "armeabi-v7a")
 }
 val buildUniversalApk = targetAbis.size > 1
+// A separately installable hardware-test build preserves the installed receiver and its data.
+val renderClockProbe = project.findProperty("renderClockProbe")?.toString() == "true"
 
 android {
     namespace = "com.weekd.miracastreceiver"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.weekd.miracastreceiver"
+        applicationId = if (renderClockProbe) {
+            "com.weekd.miracastreceiver.renderprobe"
+        } else {
+            "com.weekd.miracastreceiver"
+        }
         minSdk = 21
         targetSdk = 36
         versionCode = 14
-        versionName = "1.2.9"
+        versionName = if (renderClockProbe) "1.2.9-renderprobe" else "1.2.9"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

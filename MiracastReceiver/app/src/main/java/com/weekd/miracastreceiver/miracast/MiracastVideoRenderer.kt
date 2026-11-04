@@ -75,9 +75,11 @@ class MiracastVideoRenderer(
     private var statDiscontinuities = 0L
     private var statDecoderStalls = 0L
     private var statStallsSuppressed = 0L
-    /** 累计真正送显的帧数（跨解码器重建累加）—— 这才是「屏幕上有没有动」的证据。 */
+    /** 累计 dequeue 到的输出 buffer（跨重建）；不是物理呈现或像素更新证据。 */
     private var statOutputFrames = 0L
     private var statLastDecoderFrames = 0L
+    private var statRenderCallbacks = 0L
+    private var statLastDecoderCallbacks = 0L
     private var statLastReport = System.currentTimeMillis()
 
     private fun reportStats() {
@@ -85,26 +87,39 @@ class MiracastVideoRenderer(
         if (now - statLastReport < 1000) return
         statLastReport = now
 
-        // 从当前解码器取增量，累加进跨重建的总数。重建会让 outputFrameCount 归零，
-        // 直接读它会把总数算丢。
+        // 两类计数都跨重建累计；回调表示 MediaCodec 报告呈现，不证明屏幕像素在变化。
         decoder?.let { d ->
+            accumulateDecoderStats(d)
             val current = d.outputFrameCount
-            if (current >= statLastDecoderFrames) statOutputFrames += current - statLastDecoderFrames
-            statLastDecoderFrames = current
-            // 真正出帧了说明解码器是健康的，重建退避归零 —— 下次真出问题时能立刻救。
+            // 维持既有退避行为：有输出 buffer 就归零，不把它当作物理呈现证明。
             if (current > 0 && consecutiveRebuilds > 0) {
                 consecutiveRebuilds = 0
                 rebuildBackoffMs = 0L
             }
         }
+        val render = decoder?.frameRenderStats()
         Timber.i(
             "Miracast video stats: units=$statUnits decoded=$statDecoded " +
                 "noSurface=$statDroppedNoSurface noConfig=$statDroppedNoConfig " +
                 "noIdr=$statDroppedNoIdr disc=$statDiscontinuities stalls=$statDecoderStalls " +
                 "stallSkip=$statStallsSuppressed backoff=${rebuildBackoffMs}ms " +
-                "out=$statOutputFrames hasSps=${sps != null} hasPps=${pps != null} " +
+                "out=$statOutputFrames renderCb=$statRenderCallbacks " +
+                "renderCbSupported=${render?.supported ?: false} renderCbAgeMs=${render?.lastCallbackAgeMs ?: -1L} " +
+                "cbPtsUs=${render?.callbackPresentationTimeUs ?: -1L} cbRenderNs=${render?.callbackRenderTimeNs ?: -1L} " +
+                "cbSubmitNs=${render?.callbackSubmitTimeNs ?: -1L} " +
+                "submitPtsUs=${render?.lastSubmitPresentationTimeUs ?: -1L} submitNs=${render?.lastSubmitTimeNs ?: -1L} " +
+                "hasSps=${sps != null} hasPps=${pps != null} " +
                 "decoder=${decoder != null} awaitingKeyframe=$awaitingKeyframe"
         )
+    }
+
+    private fun accumulateDecoderStats(d: VideoDecoder) {
+        val output = d.outputFrameCount
+        statOutputFrames += (output - statLastDecoderFrames).coerceAtLeast(0L)
+        statLastDecoderFrames = output
+        val callbacks = d.frameRenderStats().callbackCount
+        statRenderCallbacks += (callbacks - statLastDecoderCallbacks).coerceAtLeast(0L)
+        statLastDecoderCallbacks = callbacks
     }
 
     /** [TsDemuxer] 的回调入口。 */
@@ -189,7 +204,8 @@ class MiracastVideoRenderer(
         decoder = VideoDecoder(surface).also { it.initialize(spsBytes, ppsBytes, width, height) }
         configuredSurface = surface
         statLastDecoderFrames = 0L
-        // 注意：不要在这里清零 consecutiveRebuilds —— 退避只有在「真正解出帧」后才该撤销，
+        statLastDecoderCallbacks = 0L
+        // 注意：不要在这里清零 consecutiveRebuilds —— 退避只有在取到输出 buffer 后才撤销，
         // 否则每次重建都会把计数归零，退避形同虚设。
         awaitingKeyframe = true
         Timber.i("Miracast decoder initialized: ${width}x$height")
@@ -248,9 +264,14 @@ class MiracastVideoRenderer(
     }
 
     private fun releaseDecoder() {
-        decoder?.release()
+        decoder?.let { d ->
+            d.release()
+            if (BuildConfig.DEBUG) accumulateDecoderStats(d)
+        }
         decoder = null
         configuredSurface = null
+        statLastDecoderFrames = 0L
+        statLastDecoderCallbacks = 0L
     }
 
     fun release() {
