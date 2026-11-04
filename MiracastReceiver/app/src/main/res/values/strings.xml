@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- 默认语言（英文）。其他语言见 values-zh、values-zh-rTW 等目录，新增条目时要同步补齐。 -->
 <resources>
+    <string name="auto_rotate_to_fit">Auto-rotate to fit screen</string>
     <string name="app_name" translatable="false">Miracast Receiver</string>
 
     <!-- 首页 -->
@@ -9,20 +10,26 @@
     <string name="device_ip_fetching">Detecting…</string>
     <string name="how_to_connect">How to connect</string>
     <string name="connect_instruction">1. Make sure the sending device and the TV are on the same local network\n2. Open the casting app on the sender\n3. Scan for and select this device\n4. Start casting</string>
-
-    <!-- 调试选项（仅 debug 构建显示，见 MainActivity 里的 BuildConfig.DEBUG 判断） -->
-    <string name="debug_settings_title">Debug options</string>
-    <string name="debug_settings_hint">Only visible in debug builds. Toggle these to compare Miracast behaviour on the same device; each change takes effect on the next cast session.</string>
-    <string name="tuning_dual_client_port">Declare RTCP port in SETUP</string>
-    <string name="tuning_rtcp_port">Bind and drain the RTCP port</string>
-    <string name="tuning_socket_dynamic">Enumerate wpa_supplicant sockets dynamically</string>
     <string name="auto_start_on_boot">Start receiver on boot</string>
     <string name="auto_start_on_boot_hint">Runs in the background after the TV turns on, without opening this app. Some TVs also require allowing auto-start for this app in system settings.</string>
+    <string name="return_to_app_after_cast">Return to this app after casting</string>
+    <string name="return_to_app_after_cast_hint">Stops on this settings page instead of going back to the TV home screen when you stop casting. Useful when you want to change settings right after a session.</string>
     <string name="language">Language</string>
     <string name="language_follow_system">Follow system</string>
     <string name="status_no_network">No network connection</string>
     <string name="status_no_wifi">Not connected to Wi-Fi</string>
     <string name="status_service_starting">Starting service…</string>
+    <string name="status_waiting_network">Waiting for a network address. Check the network connection.</string>
+    <string name="status_receiver_running">Receiver service is running. Waiting for a connection.</string>
+    <string name="status_receiver_stopped">Receiver service is stopped. Reopen the app to retry.</string>
+    <string name="status_miracast_checking">Checking Windows / Android screen mirroring…</string>
+    <string name="status_miracast_advertising">Miracast discovery configured. On Windows press Win+K; on Android open wireless display. Discovery also depends on the device driver.</string>
+    <string name="status_miracast_system">System Wi-Fi Display is enabled. If the device is missing from Win+K, open the system screen mirroring receiver and try again; this switch alone does not confirm receiving support.</string>
+    <string name="status_miracast_root_required">Windows / Android screen mirroring is unavailable: root access was not granted. If this device has a system screen mirroring receiver, enable it first; otherwise root is required to enable discovery. AirPlay, DLNA and VLC Cast can still be used.</string>
+    <string name="status_miracast_failed">Windows / Android screen mirroring could not be configured. Check system screen mirroring, Wi-Fi Direct support and root authorization, then reopen the app to retry. Please include ADB logs if it still fails. Other casting methods can still be used.</string>
+    <string name="status_miracast_unsupported">This device does not provide Wi-Fi Direct, which Windows / Android screen mirroring requires. Use AirPlay, DLNA or VLC Cast.</string>
+    <string name="status_miracast_permission">Windows / Android screen mirroring needs the Nearby devices or Location permission. Grant it in system app settings and reopen the app.</string>
+    <string name="status_miracast_wifi_disabled">Windows / Android screen mirroring needs Wi-Fi Direct. Enable Wi-Fi and reopen the app; an Ethernet connection alone is not enough.</string>
     <string name="status_permission_denied">Location permission not granted. Windows wireless casting is unavailable.</string>
 
     <!-- 悬浮窗权限 -->
@@ -101,4 +108,5 @@
     <string name="notification_channel_name">Cast receiver service</string>
     <string name="notification_channel_description">Keeps the cast receiver service running</string>
     <string name="notification_waiting">Waiting for AirPlay / DLNA / Miracast connections</string>
+    <string name="notification_stop_cast">Stop casting</string>
 </resources>

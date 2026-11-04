@@ -16,21 +16,19 @@ import androidx.appcompat.widget.SwitchCompat
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
-import com.weekd.miracastreceiver.BuildConfig
 import com.weekd.miracastreceiver.R
 import com.weekd.miracastreceiver.discovery.DeviceInfoProvider
 import com.weekd.miracastreceiver.discovery.MdnsAdvertiser
-import com.weekd.miracastreceiver.miracast.MiracastTuning
-import com.weekd.miracastreceiver.miracast.WfdRootHelper
 import com.weekd.miracastreceiver.service.CastReceiverService
+import com.weekd.miracastreceiver.service.ReceiverStatus
 import com.weekd.miracastreceiver.util.AppLanguage
 import com.weekd.miracastreceiver.util.AppSettings
 import com.weekd.miracastreceiver.utils.NetworkUtils
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import timber.log.Timber
 import android.widget.TextView
+import android.widget.ProgressBar
 
 /**
  * 主 Activity - 等待投屏连接
@@ -43,7 +41,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvDeviceName: TextView
     private lateinit var tvDeviceIp: TextView
     private lateinit var tvStatus: TextView
+    private lateinit var tvMiracastStatus: TextView
+    private lateinit var startupProgress: ProgressBar
     private lateinit var switchAutoStart: SwitchCompat
+    private lateinit var switchReturnToApp: SwitchCompat
     private lateinit var tvLanguageValue: TextView
 
     /** 定位权限弹窗还在时不叠加悬浮窗权限提示，等它有结果再说 */
@@ -175,7 +176,14 @@ class MainActivity : AppCompatActivity() {
         tvDeviceName = findViewById(R.id.tv_device_name)
         tvDeviceIp = findViewById(R.id.tv_device_ip)
         tvStatus = findViewById(R.id.tv_status)
+        tvMiracastStatus = findViewById(R.id.tv_miracast_status)
+        startupProgress = findViewById(R.id.startup_progress)
         switchAutoStart = findViewById(R.id.switch_auto_start)
+        findViewById<SwitchCompat>(R.id.switch_auto_rotate).apply {
+            isChecked = AppSettings.isAutoRotateToFit(this@MainActivity)
+            setOnCheckedChangeListener { _, checked -> AppSettings.setAutoRotateToFit(this@MainActivity, checked) }
+        }
+        switchReturnToApp = findViewById(R.id.switch_return_to_app)
         tvLanguageValue = findViewById(R.id.tv_language_value)
 
         // 开机自启开关
@@ -185,56 +193,20 @@ class MainActivity : AppCompatActivity() {
             Timber.i("Auto start on boot set to $isChecked")
         }
 
+        // 投屏结束后是否留在本应用
+        switchReturnToApp.isChecked = AppSettings.isReturnToAppAfterCast(this)
+        switchReturnToApp.setOnCheckedChangeListener { _, isChecked ->
+            AppSettings.setReturnToAppAfterCast(this, isChecked)
+            Timber.i("Return to app after cast set to $isChecked")
+        }
+
         // 界面语言
         findViewById<View>(R.id.setting_language).setOnClickListener { showLanguageDialog() }
         tvLanguageValue.text = currentLanguageLabel()
 
-        initDebugSettings()
-
         // 设置设备名称
         val deviceName = deviceInfoProvider.getDeviceName()
         tvDeviceName.text = deviceName
-    }
-
-    /**
-     * Miracast 调试开关，只有 debug 构建才显示。
-     *
-     * 这几个开关存在同一份 [AppSettings] prefs 里，release 构建里这块布局保持 GONE，
-     * 用户看到的界面和上游一致；而 debug 版可以直接在电视上改，不用重新编译。
-     */
-    private fun initDebugSettings() {
-        val group = findViewById<View>(R.id.debug_settings)
-        if (!BuildConfig.DEBUG) {
-            group.visibility = View.GONE
-            return
-        }
-        group.visibility = View.VISIBLE
-
-        bindTuningSwitch(R.id.switch_dual_client_port, MiracastTuning.isDualClientPort(this)) { on ->
-            MiracastTuning.setDualClientPort(this, on)
-        }
-        bindTuningSwitch(R.id.switch_rtcp_port, MiracastTuning.isRtcpPortEnabled(this)) { on ->
-            MiracastTuning.setRtcpPortEnabled(this, on)
-        }
-        // socket 路径只在服务启动时解析一次，改完立刻重播一次 WFD IE，省得重启应用。
-        // advertiseSink 内部会 fork su，不能放主线程。
-        bindTuningSwitch(R.id.switch_socket_dynamic, MiracastTuning.isSocketPathDynamic(this)) { on ->
-            MiracastTuning.setSocketPathDynamic(this, on)
-            val app = applicationContext
-            lifecycleScope.launch(Dispatchers.IO) {
-                val ok = WfdRootHelper.advertiseSink(app)
-                Timber.i("Miracast tuning: re-advertised sink after socket mode change (ok=$ok)")
-            }
-        }
-    }
-
-    private fun bindTuningSwitch(id: Int, initial: Boolean, onChange: (Boolean) -> Unit) {
-        val view = findViewById<SwitchCompat>(id)
-        view.isChecked = initial
-        view.setOnCheckedChangeListener { _, isChecked ->
-            onChange(isChecked)
-            Timber.i("Miracast tuning ${resources.getResourceEntryName(id)} = $isChecked")
-        }
     }
 
     /** 第一项是「跟随系统」，其后是 [AppLanguage.OPTIONS]。 */
@@ -264,7 +236,6 @@ class MainActivity : AppCompatActivity() {
         if (!NetworkUtils.isNetworkAvailable(this)) {
             tvStatus.text = getString(R.string.status_no_network)
             Timber.w("Network not available")
-            return
         }
 
         if (!NetworkUtils.isWifiConnected(this)) {
@@ -318,11 +289,29 @@ class MainActivity : AppCompatActivity() {
     private fun updateStatus() {
         lifecycleScope.launch {
             while (true) {
-                if (mdnsAdvertiser.isAdvertising()) {
-                    tvStatus.text = getString(R.string.waiting_connection)
-                } else {
-                    tvStatus.text = getString(R.string.status_service_starting)
-                }
+                val service = ReceiverStatus.service
+                val miracast = ReceiverStatus.miracast
+                tvStatus.setText(when (service) {
+                    ReceiverStatus.Service.STARTING -> R.string.status_service_starting
+                    ReceiverStatus.Service.WAITING_NETWORK -> R.string.status_waiting_network
+                    ReceiverStatus.Service.RUNNING -> R.string.status_receiver_running
+                    ReceiverStatus.Service.STOPPED -> R.string.status_receiver_stopped
+                })
+                tvMiracastStatus.visibility = if (service == ReceiverStatus.Service.RUNNING) View.VISIBLE else View.GONE
+                tvMiracastStatus.setText(when (miracast) {
+                    ReceiverStatus.Miracast.CHECKING -> R.string.status_miracast_checking
+                    ReceiverStatus.Miracast.ADVERTISING -> R.string.status_miracast_advertising
+                    ReceiverStatus.Miracast.SYSTEM_MANAGED -> R.string.status_miracast_system
+                    ReceiverStatus.Miracast.ROOT_REQUIRED -> R.string.status_miracast_root_required
+                    ReceiverStatus.Miracast.SETUP_FAILED -> R.string.status_miracast_failed
+                    ReceiverStatus.Miracast.UNSUPPORTED -> R.string.status_miracast_unsupported
+                    ReceiverStatus.Miracast.PERMISSION_REQUIRED -> R.string.status_miracast_permission
+                    ReceiverStatus.Miracast.WIFI_DISABLED -> R.string.status_miracast_wifi_disabled
+                })
+                startupProgress.visibility = if (service == ReceiverStatus.Service.STARTING ||
+                    service == ReceiverStatus.Service.WAITING_NETWORK ||
+                    (service == ReceiverStatus.Service.RUNNING && miracast == ReceiverStatus.Miracast.CHECKING))
+                    View.VISIBLE else View.GONE
                 delay(2000)
             }
         }

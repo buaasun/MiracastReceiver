@@ -34,6 +34,7 @@ class WfdServer(
 
     @Volatile
     private var isRunning = false
+    @Volatile private var reconnectAfterMs = 0L
 
     private var sessionHandler: WfdSessionHandler? = null
     private var rtpReceiver: RtpReceiver? = null
@@ -61,6 +62,10 @@ class WfdServer(
         scope.launch {
             while (isRunning) {
                 try {
+                    if (android.os.SystemClock.elapsedRealtime() < reconnectAfterMs) {
+                        delay(SCAN_INTERVAL_MS)
+                        continue
+                    }
                     val socket = dialSource()
                     if (socket != null) {
                         runSession(socket)
@@ -132,14 +137,7 @@ class WfdServer(
         // RTP 接收必须先起来：M3 会把端口告诉 Source，M7 之后随时可能来包。
         // 送显目标复用镜像专用 SurfaceView（与 AirPlay 镜像同一块），
         // 播放页尚未创建时返回 null，解码器会等它就绪。
-        val receiver = RtpReceiver(
-            context,
-            rtpPort,
-            { com.weekd.miracastreceiver.ui.PlayerActivity.mirrorSurface },
-            // IDR 请求要发到 RTSP 连接上，而 handler 在下面才构造 —— 用 lambda 延迟绑定，
-            // 会话建立后 sessionId 才有值。
-            idrRequester = { sessionHandler?.requestIdr() }
-        ).apply {
+        val receiver = RtpReceiver(rtpPort, { com.weekd.miracastreceiver.ui.PlayerActivity.mirrorSurface }).apply {
             onError = { Timber.e("Miracast RTP error: $it") }
             start()
         }
@@ -172,4 +170,10 @@ class WfdServer(
     }
 
     fun isRunning(): Boolean = isRunning
+
+    fun disconnectSender() {
+        reconnectAfterMs = android.os.SystemClock.elapsedRealtime() + 5000
+        val current = sessionHandler
+        scope.launch { runCatching { current?.disconnectSender() } }
+    }
 }

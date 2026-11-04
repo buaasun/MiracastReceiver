@@ -1,6 +1,7 @@
 package com.weekd.miracastreceiver.service
 
 import android.app.Notification
+import android.app.PendingIntent
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
@@ -19,6 +20,10 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.weekd.miracastreceiver.R
+import com.weekd.miracastreceiver.cast.CastPlayerBridge
+import com.weekd.miracastreceiver.cast.GoogleCastReceiver
+import com.weekd.miracastreceiver.airplay.AirPlayCapabilities
+import com.weekd.miracastreceiver.airplay.fitMirrorResolution
 import com.weekd.miracastreceiver.airplay.AirPlayReceiver
 import com.weekd.miracastreceiver.discovery.DeviceInfoProvider
 import com.weekd.miracastreceiver.dlna.DlnaMediaRenderer
@@ -42,6 +47,7 @@ class CastReceiverService : Service() {
         /** 由 BootReceiver 设置：标记这次启动来自开机广播。 */
         const val EXTRA_FROM_BOOT = "from_boot"
 
+        private const val ACTION_STOP_CAST = "com.weekd.miracastreceiver.STOP_CAST"
         private const val NOTIFICATION_ID = 1001
         private const val CHANNEL_ID = "cast_receiver_service"
         private const val ACTION_UPDATE_POSITION = "com.weekd.miracastreceiver.ACTION_UPDATE_POSITION"
@@ -50,18 +56,18 @@ class CastReceiverService : Service() {
         /** 开机后等网络就绪的轮询间隔与最长等待时间。 */
         private const val NETWORK_RETRY_INTERVAL_MS = 5_000L
         private const val NETWORK_MAX_WAIT_MS = 5 * 60_000L
+        // Serialize root commands and cleanup without blocking the service/UI thread.
+        private val wfdRootExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
     }
 
     private lateinit var airPlayReceiver: AirPlayReceiver
     private lateinit var dlnaRenderer: DlnaMediaRenderer
+    private lateinit var castPlayerBridge: CastPlayerBridge
+    private lateinit var googleCastReceiver: GoogleCastReceiver
     private lateinit var ssdpServer: SsdpServer
     private lateinit var upnpHttpServer: UpnpHttpServer
     private lateinit var wfdServer: WfdServer
     private lateinit var wifiDirectManager: WifiDirectManager
-
-    /** 仅 debug 构建：Windows 发起配对后 2 秒自动点「接受」。 */
-    private val p2pAutoAccept: com.weekd.miracastreceiver.miracast.P2pAutoAccept? =
-        if (com.weekd.miracastreceiver.BuildConfig.DEBUG) com.weekd.miracastreceiver.miracast.P2pAutoAccept() else null
     /** startAllServices() 已执行；防止重复 onStartCommand 再建一套接收器。 */
     private var servicesStarted = false
     private lateinit var deviceUuid: String
@@ -72,10 +78,24 @@ class CastReceiverService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var networkWaitRunnable: Runnable? = null
     private var networkWaitElapsedMs = 0L
+    private var stopping = false
+    private var rootAdvertisingPending = false
+    private var rootAdvertisingAttempted = false
+    private var p2pFailure: ReceiverStatus.Miracast? = null
+    private var p2pGroupReady = false
 
     private val playerStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
+                CastPlayerBridge.ACTION_STATE -> castPlayerBridge.onState(intent)
+                "com.weekd.miracastreceiver.DISCONNECT_SENDER" -> {
+                    if (intent.getBooleanExtra("miracast", false)) {
+                        wfdServer.disconnectSender()
+                        wifiDirectManager.disconnectSender()
+                    } else {
+                        airPlayReceiver.disconnectSender()
+                    }
+                }
                 ACTION_UPDATE_POSITION -> {
                     val position = intent.getLongExtra("position", 0L)
                     val duration = intent.getLongExtra("duration", 0L)
@@ -101,6 +121,8 @@ class CastReceiverService : Service() {
     }
 
     override fun onCreate() {
+        ReceiverStatus.service = ReceiverStatus.Service.STARTING
+        ReceiverStatus.miracast = ReceiverStatus.Miracast.CHECKING
         super.onCreate()
         Timber.i("CastReceiverService created")
         createNotificationChannel()
@@ -119,7 +141,14 @@ class CastReceiverService : Service() {
         // 初始化设备 UUID
         deviceUuid = generateDeviceUuid()
 
-        val mirrorResolution = getBestDisplayResolution()
+        // A 4K display alone is insufficient: macOS may choose HEVC even when the
+        // receiver has only advertised AVC. Keep AVC-only hardware within 1080p.
+        val displayResolution = getBestDisplayResolution()
+        val mirrorResolution = if (AirPlayCapabilities.hardwareHevc4k) {
+            displayResolution
+        } else {
+            fitMirrorResolution(displayResolution.first, displayResolution.second, 1920, 1080)
+        }
         val deviceName = DeviceInfoProvider(this).getDeviceName()
         Timber.i("AirPlay mirror advertised resolution: ${mirrorResolution.first}x${mirrorResolution.second}")
 
@@ -141,14 +170,12 @@ class CastReceiverService : Service() {
                         flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
                     }
                     startActivity(intent)
-                } else if (state != com.weekd.miracastreceiver.airplay.AirPlayState.CONNECTED &&
-                    airPlayPlayerStarted
-                ) {
-                    // iPhone 结束镜像（TEARDOWN 或连接断开）后必须主动关掉播放页，
-                    // 否则画面会一直停在最后一帧。只在确实由 AirPlay 拉起过播放页时才发，
-                    // 免得误关正在播放的 DLNA 内容。
+                }
+            },
+            onSessionEnded = {
+                if (airPlayPlayerStarted) {
                     airPlayPlayerStarted = false
-                    Timber.i("AirPlay disconnected ($state), closing player")
+                    Timber.i("AirPlay session ended, closing player")
                     sendBroadcast(Intent(com.weekd.miracastreceiver.ui.PlayerActivity.ACTION_STOP).apply {
                         setPackage(packageName)
                     })
@@ -162,7 +189,11 @@ class CastReceiverService : Service() {
 
         // 初始化 DLNA/UPnP 服务
         initDlnaServices()
+        castPlayerBridge = CastPlayerBridge(this)
+        googleCastReceiver = GoogleCastReceiver(this, deviceName, deviceUuid, castPlayerBridge.session)
         val playerStateFilter = IntentFilter().apply {
+            addAction(CastPlayerBridge.ACTION_STATE)
+            addAction("com.weekd.miracastreceiver.DISCONNECT_SENDER")
             addAction(ACTION_UPDATE_POSITION)
             addAction(ACTION_PLAYBACK_STOPPED)
         }
@@ -219,8 +250,25 @@ class CastReceiverService : Service() {
 
         // 初始化 Wi-Fi Direct 以支持 Windows 无线显示器发现
         wifiDirectManager = WifiDirectManager(this, DeviceInfoProvider(this).getDeviceName()).apply {
+            onStartupState = stateChanged@{ state ->
+                if (stopping) return@stateChanged
+                p2pFailure = when (state) {
+                    WifiDirectManager.StartupState.STARTING -> null
+                    WifiDirectManager.StartupState.UNSUPPORTED -> ReceiverStatus.Miracast.UNSUPPORTED
+                    WifiDirectManager.StartupState.PERMISSION_REQUIRED -> ReceiverStatus.Miracast.PERMISSION_REQUIRED
+                    WifiDirectManager.StartupState.WIFI_DISABLED -> ReceiverStatus.Miracast.WIFI_DISABLED
+                    WifiDirectManager.StartupState.FAILED -> ReceiverStatus.Miracast.SETUP_FAILED
+                }
+                ReceiverStatus.miracast = p2pFailure ?: ReceiverStatus.Miracast.CHECKING
+            }
+            onWfdConfigured = {
+                if (!stopping && p2pGroupReady && p2pFailure == null) ReceiverStatus.miracast = ReceiverStatus.Miracast.ADVERTISING
+            }
             onGroupCreated = { group ->
                 Timber.i("Wi-Fi Direct group created for Miracast: ${group.networkName}")
+                p2pGroupReady = true
+                p2pFailure = null
+                advertiseMiracast()
             }
             onDeviceConnected = { device ->
                 Timber.i("Miracast device connected: ${device.deviceName}")
@@ -352,6 +400,15 @@ class CastReceiverService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP_CAST) {
+            // Stop the service as well as the player: audio can outlive its Surface/Activity.
+            airPlayPlayerStarted = false
+            sendBroadcast(Intent(com.weekd.miracastreceiver.ui.PlayerActivity.ACTION_STOP).apply {
+                setPackage(packageName)
+            })
+            stopSelf()
+            return START_NOT_STICKY
+        }
         val fromBoot = intent?.getBooleanExtra(EXTRA_FROM_BOOT, false) ?: false
         Timber.i("CastReceiverService started (fromBoot=$fromBoot)")
 
@@ -414,6 +471,7 @@ class CastReceiverService : Service() {
         }
 
         Timber.i("Network not ready yet, retry in ${NETWORK_RETRY_INTERVAL_MS}ms")
+        ReceiverStatus.service = ReceiverStatus.Service.WAITING_NETWORK
         val runnable = Runnable {
             networkWaitElapsedMs += NETWORK_RETRY_INTERVAL_MS
             startWhenNetworkReady()
@@ -426,28 +484,67 @@ class CastReceiverService : Service() {
         servicesStarted = true
         // 启动 AirPlay 2 接收器
         airPlayReceiver.start()
-        // 播放页换渲染 Surface（手动旋转画面）时，让 AirPlay 投送的 URL 视频跟着换过去
+        // Surface 重建时，恢复 AirPlay URL 视频与屏幕镜像的输出
         com.weekd.miracastreceiver.ui.PlayerActivity.mirrorSurfaceListener = { airPlayReceiver.onVideoSurfaceChanged() }
 
         // 启动 DLNA/UPnP 服务
         upnpHttpServer.start()
         ssdpServer.start()
+        googleCastReceiver.start()
 
         // 启动 Windows 无线显示器（Miracast/WFD）
-        // 先建 P2P 组，再注入 WFD IE —— 顺序反了的话建组会覆盖掉刚设的 IE。
+        // Inject after onGroupCreated: createGroup is asynchronous and can overwrite WFD IE.
         wifiDirectManager.start()
-        p2pAutoAccept?.start()
-        if (WfdRootHelper.advertiseSink(this)) {
-            Timber.i("Miracast: 已作为 Wi-Fi Display Sink 对外广播，Windows 可发现")
-        } else {
-            Timber.w("Miracast: 未能注入 WFD IE（需要 root），Windows 无法发现本机")
-        }
+        mainHandler.postDelayed({
+            if (!stopping && ReceiverStatus.miracast == ReceiverStatus.Miracast.CHECKING) {
+                ReceiverStatus.miracast = ReceiverStatus.Miracast.SETUP_FAILED
+            }
+        }, 30_000L)
         wfdServer.start()
+        ReceiverStatus.service = ReceiverStatus.Service.RUNNING
 
-        Timber.i("All cast services started (AirPlay + DLNA + Miracast/WFD)")
+        Timber.i("All cast services started (AirPlay + DLNA + Miracast/WFD + experimental Google Cast)")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun advertiseMiracast() {
+        if (stopping) return
+        if (wifiDirectManager.isWfdConfigured) {
+            ReceiverStatus.miracast = ReceiverStatus.Miracast.ADVERTISING
+            return
+        }
+        // This setting alone does not prove Sink capability. Report it as unverified,
+        // and allow systems with their own WFD advertising to work without root.
+        val systemEnabled = runCatching {
+            android.provider.Settings.Global.getInt(contentResolver, "wifi_display_on", 0) == 1
+        }.getOrDefault(false)
+        if (systemEnabled) {
+            ReceiverStatus.miracast = ReceiverStatus.Miracast.SYSTEM_MANAGED
+            return
+        }
+        if (rootAdvertisingPending) return
+        rootAdvertisingPending = true
+        rootAdvertisingAttempted = true
+        ReceiverStatus.miracast = ReceiverStatus.Miracast.CHECKING
+        val appContext = applicationContext
+        wfdRootExecutor.execute {
+            val result = runCatching { WfdRootHelper.advertiseSinkResult(appContext) }
+                .getOrDefault(WfdRootHelper.AdvertiseResult.COMMAND_FAILED)
+            mainHandler.post {
+                rootAdvertisingPending = false
+                if (!stopping) {
+                    ReceiverStatus.miracast = p2pFailure ?: when {
+                        wifiDirectManager.isWfdConfigured -> ReceiverStatus.Miracast.ADVERTISING
+                        result == WfdRootHelper.AdvertiseResult.COMMAND_SENT -> ReceiverStatus.Miracast.ADVERTISING
+                        result == WfdRootHelper.AdvertiseResult.ROOT_UNAVAILABLE -> ReceiverStatus.Miracast.ROOT_REQUIRED
+                        else -> ReceiverStatus.Miracast.SETUP_FAILED
+                    }
+                    Timber.i("Miracast startup: %s (%s)", ReceiverStatus.miracast, result)
+                }
+            }
+        }
+    }
 
     /** 用户从最近任务里划掉应用时也要断开投屏，否则发送端会以为连接还在。 */
     override fun onTaskRemoved(rootIntent: Intent?) {
@@ -458,6 +555,8 @@ class CastReceiverService : Service() {
     }
 
     override fun onDestroy() {
+        stopping = true
+        ReceiverStatus.service = ReceiverStatus.Service.STOPPED
         super.onDestroy()
         Timber.i("CastReceiverService destroyed")
 
@@ -480,6 +579,8 @@ class CastReceiverService : Service() {
         // 停止 DLNA/UPnP 服务
         ssdpServer.stop()
         upnpHttpServer.stop()
+        googleCastReceiver.stop()
+        castPlayerBridge.stop()
 
         shutdownMiracast()
     }
@@ -491,9 +592,13 @@ class CastReceiverService : Service() {
      * 不主动撤销的话，应用关掉之后 Windows 依然能搜到这台设备并尝试连接。
      */
     private fun shutdownMiracast() {
+        stopping = true
         runCatching { wfdServer.stop() }
-        runCatching { WfdRootHelper.stopAdvertising(this) }
-        runCatching { p2pAutoAccept?.stop() }
+        if (rootAdvertisingAttempted) {
+            rootAdvertisingAttempted = false
+            val appContext = applicationContext
+            wfdRootExecutor.execute { runCatching { WfdRootHelper.stopAdvertising(appContext) } }
+        }
         runCatching { wifiDirectManager.stop() }
     }
 
@@ -521,12 +626,22 @@ class CastReceiverService : Service() {
     }
 
     private fun createNotification(): Notification {
+        val openApp = PendingIntent.getActivity(
+            this, 0, Intent(this, com.weekd.miracastreceiver.ui.MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val stopCast = PendingIntent.getService(
+            this, 1, Intent(this, CastReceiverService::class.java).setAction(ACTION_STOP_CAST),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(getString(R.string.notification_waiting))
             .setSmallIcon(R.drawable.ic_stat_miracast)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
+            .setContentIntent(openApp)
+            .addAction(android.R.drawable.ic_media_pause, getString(R.string.notification_stop_cast), stopCast)
             .build()
     }
 }

@@ -7,10 +7,10 @@ import android.view.Surface
 import com.weekd.miracastreceiver.util.Logger
 
 /**
- * VideoDecoder — Hardware H.264 video decoder using Android's MediaCodec API.
+ * VideoDecoder — Hardware AVC/HEVC video decoder using Android's MediaCodec API.
  *
- * WHY: AirPlay screen mirroring sends video as a stream of H.264-encoded frames.
- * To display these frames on screen, we need to decode the H.264 bitstream.
+ * WHY: AirPlay screen mirroring can send AVC or HEVC frames, depending on negotiated capabilities.
+ * To display these frames on screen, we need to decode the negotiated bitstream.
  * MediaCodec is Android's API to the hardware video decoder (GPU), which is
  * much faster and more power-efficient than any software decoder.
  *
@@ -63,47 +63,6 @@ class VideoDecoder(private val outputSurface: Surface) {
     private var outputRunning = false
 
     /**
-     * 最近一次成功送显的时间（[android.os.SystemClock.elapsedRealtime]）。
-     *
-     * 用来看门狗判活：这台电视的硬解（OMX.amlogic.avc.decoder.awesome）在收到大量
-     * 不连续的码流后会内部死锁 —— 输出端不再归还 buffer，输入端 16 个缓冲区全占满，
-     * 于是每帧都 `dequeueInputBuffer` 返回 -1 被丢掉。它**不会**抛 IllegalStateException，
-     * 所以 [isHealthy] 一直是 true，没人会去重建它，画面就永久冻住。
-     * 只能靠「多久没吐出帧」来发现。
-     */
-    @Volatile
-    private var lastOutputAt = 0L
-
-    /** 初始化完成的时刻，作为 [isStalled] 在第一帧到达前的判活基准。 */
-    @Volatile
-    private var initializedAt = 0L
-
-    /**
-     * 自上次输出以来成功排入解码器的输入帧数。
-     *
-     * 「喂了数据却没出帧」才是卡死；「没喂数据」只是没人送（Source 暂停、还在等 IDR）
-     * —— 后者绝不能触发重建，否则会陷入重建循环：重建后 awaitingKeyframe 又丢弃所有
-     * 非 IDR 帧，解码器拿不到输入当然没输出，于是再次被判死，约 800ms 一次无限重建。
-     */
-    @Volatile
-    var inputsSinceLastOutput = 0
-        private set
-
-    /**
-     * 「自上次成功输出以来，第一次成功输入」的时刻。
-     *
-     * 不能记「最近一次输入」—— 那个值每帧都在更新，`now - it` 永远是 0，看门狗永远不会触发。
-     * 要的是「这批没被回应的输入是从什么时候开始堆积的」。
-     */
-    @Volatile
-    private var pendingSinceAt = 0L
-
-    /** 累计送显帧数，供上层诊断/看门狗使用。 */
-    @Volatile
-    var outputFrameCount = 0L
-        private set
-
-    /**
      * Initializes the MediaCodec decoder with the video stream parameters from the SDP.
      *
      * This must be called ONCE before any calls to [decodeNalUnit].
@@ -123,8 +82,17 @@ class VideoDecoder(private val outputSurface: Surface) {
      * @param ppsBytes  The PPS NAL unit bytes (from SDP "sprop-parameter-sets" field)
      * @param width     Video width in pixels (from SDP)
      * @param height    Video height in pixels (from SDP)
+     * @param mimeType  AVC by default; HEVC for a negotiated hvcC configuration
+     * @param vpsBytes  Annex-B VPS required by HEVC; SPS/PPS are also Annex-B
      */
-    fun initialize(spsBytes: ByteArray, ppsBytes: ByteArray, width: Int, height: Int) {
+    fun initialize(
+        spsBytes: ByteArray,
+        ppsBytes: ByteArray,
+        width: Int,
+        height: Int,
+        mimeType: String = MediaFormat.MIMETYPE_VIDEO_AVC,
+        vpsBytes: ByteArray? = null
+    ) {
         if (isInitialized) {
             Logger.w("VideoDecoder.initialize() called twice — ignoring second call")
             return
@@ -135,30 +103,39 @@ class VideoDecoder(private val outputSurface: Surface) {
         // MediaCodec with that wedges the decoder (no input buffers, no frames). The hardware
         // decoder reads the true size from the SPS (csd-0) itself and reports it via
         // INFO_OUTPUT_FORMAT_CHANGED, which we use to refine the size for aspect-fit.
-        val parsed = Companion.parseSpsResolution(spsBytes)
-        val (actualWidth, actualHeight) = parsed?.takeIf { isPlausibleSize(it.first, it.second) } ?: run {
-            Logger.w("SPS resolution $parsed implausible/failed — using hint ${width}x${height}")
-            Pair(width, height)
+        val parsed = if (mimeType == MediaFormat.MIMETYPE_VIDEO_AVC) parseSpsResolution(spsBytes) else null
+        val (actualWidth, actualHeight) = when {
+            mimeType == MediaFormat.MIMETYPE_VIDEO_HEVC -> Pair(width, height)
+            parsed != null && isPlausibleSize(parsed.first, parsed.second) -> parsed
+            else -> {
+                Logger.w("SPS resolution $parsed implausible/failed — using hint ${width}x${height}")
+                Pair(width, height)
+            }
         }
 
-        Logger.i("Initializing H.264 decoder: ${actualWidth}x${actualHeight} " +
+        Logger.i("Initializing $mimeType decoder: ${actualWidth}x${actualHeight} " +
                  "(hint was ${width}x${height})")
 
         // Provisional size for StreamingScreen aspect-fit; replaced by the decoder's reported size.
         StreamStats.videoWidth = actualWidth
         StreamStats.videoHeight = actualHeight
-        StreamStats.videoCodec = MediaFormat.MIMETYPE_VIDEO_AVC
+        StreamStats.videoCodec = mimeType
 
-        // Create the MediaFormat that describes the H.264 stream to the hardware decoder
+        // Describe the negotiated stream to the hardware decoder.
         val format = MediaFormat.createVideoFormat(
-            MediaFormat.MIMETYPE_VIDEO_AVC,  // AVC = Advanced Video Coding = H.264
+            mimeType,
             actualWidth,
             actualHeight
         ).apply {
             // Provide SPS and PPS so MediaCodec can configure the hardware decoder.
             // These are wrapped in ByteBuffers as required by the MediaCodec API.
-            setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(spsBytes))  // SPS
-            setByteBuffer("csd-1", java.nio.ByteBuffer.wrap(ppsBytes))  // PPS
+            if (mimeType == MediaFormat.MIMETYPE_VIDEO_HEVC) {
+                require(vpsBytes != null) { "HEVC requires VPS" }
+                setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(vpsBytes + spsBytes + ppsBytes))
+            } else {
+                setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(spsBytes))
+                setByteBuffer("csd-1", java.nio.ByteBuffer.wrap(ppsBytes))
+            }
             // NOTE: do NOT set KEY_MAX_WIDTH/HEIGHT here — this SoC's MStar decoder rejects
             // adaptive playback (BadParameter / buffer-count failures) and produces banding.
             // Resolution changes are handled by recreating the decoder in MirrorStreamServer.
@@ -172,10 +149,15 @@ class VideoDecoder(private val outputSurface: Surface) {
             setInteger(MediaFormat.KEY_PRIORITY, 0)            // 0 = 实时任务
         }
 
-        // Create the hardware H.264 decoder.
-        // "video/avc" is the MIME type for H.264. Android will pick the best
-        // available hardware decoder for this format.
-        mediaCodec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        // Use the same HEVC decoder whose 4K capability was advertised to the sender.
+        mediaCodec = if (mimeType == MediaFormat.MIMETYPE_VIDEO_HEVC) {
+            val decoderName = requireNotNull(AirPlayCapabilities.hevcDecoderName(actualWidth, actualHeight)) {
+                "No compatible HEVC hardware decoder"
+            }
+            MediaCodec.createByCodecName(decoderName)
+        } else {
+            MediaCodec.createDecoderByType(mimeType)
+        }
 
         // Configure the decoder:
         // - format: what the input will look like (H.264, width, height, SPS/PPS)
@@ -185,14 +167,9 @@ class VideoDecoder(private val outputSurface: Surface) {
         mediaCodec!!.configure(format, outputSurface, null, 0)
         mediaCodec!!.start()
 
-        initializedAt = android.os.SystemClock.elapsedRealtime()
-        lastOutputAt = 0L
-        outputFrameCount = 0L
-        inputsSinceLastOutput = 0
-        pendingSinceAt = 0L
         isInitialized = true
         startOutputThread()
-        Logger.i("H.264 decoder initialized successfully")
+        Logger.i("$mimeType decoder initialized successfully")
     }
 
     /** 启动输出线程：阻塞等待解码完成的帧并立即送显。 */
@@ -206,13 +183,7 @@ class VideoDecoder(private val outputSurface: Surface) {
                     // 阻塞等待而不是轮询：解码器一有输出就立刻返回，延迟最低
                     val index = codec.dequeueOutputBuffer(bufferInfo, OUTPUT_BUFFER_TIMEOUT_US)
                     when {
-                        index >= 0 -> {
-                            lastOutputAt = android.os.SystemClock.elapsedRealtime()
-                            outputFrameCount++
-                            inputsSinceLastOutput = 0
-                            pendingSinceAt = 0L
-                            codec.releaseOutputBuffer(index, true)
-                        }
+                        index >= 0 -> codec.releaseOutputBuffer(index, true)
                         index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ->
                             publishOutputSize(codec.outputFormat)
                         // INFO_TRY_AGAIN_LATER：超时无输出，继续等
@@ -281,11 +252,6 @@ class VideoDecoder(private val outputSurface: Surface) {
                     presentationTimeUs,
                     0                  // flags: 0 = normal frame (not end-of-stream)
                 )
-                // 只有真正排进去的帧才算「解码器被喂了数据」，看门狗据此判断卡死。
-                if (inputsSinceLastOutput == 0) {
-                    pendingSinceAt = android.os.SystemClock.elapsedRealtime()
-                }
-                inputsSinceLastOutput++
             } else {
                 // No input buffer available — the decoder is catching up.
                 // Drop this NAL unit to avoid building up backlog (prefer low latency).
@@ -351,28 +317,6 @@ class VideoDecoder(private val outputSurface: Surface) {
         }
     }
 
-    /**
-     * 解码器是否已经「卡死」。
-     *
-     * 判据是「**喂了数据却不出帧**」，而不是单纯的「多久没输出」：
-     * - 只看时间会误伤「没喂数据」的场景（Source 暂停、刚重建完还在等 IDR），
-     *   而重建后 awaitingKeyframe 会丢弃所有非 IDR 帧 —— 解码器拿不到输入当然没输出，
-     *   于是再次被判死，形成约 800ms 一次的无退避重建循环，反复创建销毁这颗硬解。
-     * - 真正的死锁是：输入侧仍在成功 queueInputBuffer（[inputsSinceLastOutput] 持续增长），
-     *   但输出端一个 buffer 都不归还。
-     *
-     * 两个条件都要满足：[inputsSinceLastOutput] 达到 [STALL_MIN_INPUTS] 帧，
-     * 且距最近成功输入（或初始化）已超过 [STALL_TIMEOUT_MS]。
-     */
-    fun isStalled(): Boolean {
-        if (!isInitialized || mediaCodec == null) return false
-        if (inputsSinceLastOutput < STALL_MIN_INPUTS) return false
-        val reference = pendingSinceAt.takeIf { it > 0 }
-            ?: lastOutputAt.takeIf { it > 0 }
-            ?: initializedAt
-        return android.os.SystemClock.elapsedRealtime() - reference > STALL_TIMEOUT_MS
-    }
-
     fun release() {
         Logger.d("Releasing VideoDecoder")
 
@@ -380,52 +324,20 @@ class VideoDecoder(private val outputSurface: Surface) {
         // 一边 dequeueOutputBuffer 一边 release 会在 native 层销毁仍在使用的互斥量，
         // 直接 SIGABRT 崩掉整个进程（AudioStreamServer 里踩过同类问题）。
         outputRunning = false
-        val thread = outputThread
+        outputThread?.let { thread ->
+            runCatching { thread.join(500) }
+            if (thread.isAlive) Logger.w("VideoDecoder output thread did not exit in time")
+        }
         outputThread = null
 
-        var threadExited = true
-        thread?.let {
-            runCatching { it.join(RELEASE_JOIN_MS) }
-            threadExited = !it.isAlive
-        }
-
-        val codec = mediaCodec
-        mediaCodec = null
-        isInitialized = false
-
-        // 输出线程没退出说明它卡在 native dequeueOutputBuffer 里 —— 这正是解码器死锁的
-        // 典型表现。此时**绝不能** stop()/release()：那会在 native 层销毁它仍在使用的
-        // 互斥量，触发 SIGABRT 崩掉整个进程；stop() 本身也可能永久阻塞，而它跑在
-        // TS 解复用线程上，会卡死整条接收流水线。
-        //
-        // 泄漏一个 codec 窗口远比进程崩溃好：调用方会立刻建新解码器继续出画面，
-        // 这个僵尸 codec 交给后台线程在它真正退出后再回收。
-        if (!threadExited) {
-            Logger.w("VideoDecoder: output thread still alive — deferring codec teardown")
-            Thread({
-                runCatching { thread?.join(RELEASE_JOIN_MS) }
-                if (thread?.isAlive == true) {
-                    // 线程彻底死了，交由进程退出回收；不碰 codec 以免崩溃
-                    Logger.e("VideoDecoder: output thread never exited, leaking codec")
-                    return@Thread
-                }
-                runCatching {
-                    codec?.stop()
-                    codec?.release()
-                }.onFailure { Logger.e("Deferred codec release failed", it) }
-                Logger.i("VideoDecoder: deferred codec teardown completed")
-            }, "VideoDecoderReaper").apply {
-                isDaemon = true
-                start()
-            }
-            return
-        }
-
         try {
-            codec?.stop()
-            codec?.release()
+            mediaCodec?.stop()
+            mediaCodec?.release()
         } catch (e: Exception) {
             Logger.e("Error releasing MediaCodec (non-fatal)", e)
+        } finally {
+            mediaCodec = null
+            isInitialized = false
         }
     }
 
@@ -440,32 +352,7 @@ class VideoDecoder(private val outputSurface: Surface) {
         // 超时只是为了让线程有机会检查退出标志，不影响送显延迟。
         private const val OUTPUT_BUFFER_TIMEOUT_US = 20_000L
 
-        // 5ms —— 这个超时发生在**调用方的线程**上（Miracast 是解复用线程，AirPlay 是解码
-        // 线程），等久了整条流水线停摆：实测 100ms 时一次卡顿就能让接收队列堆满并溢出，
-        // 进而丢包 → 等关键帧 → 画面冻结数秒。解码器拿不到空缓冲区说明它已满负荷，
-        // 再等只会加剧上游积压，不如直接丢掉这一帧。
-        private const val INPUT_BUFFER_TIMEOUT_US = 5_000L
-
-        /**
-         * 多久没吐出帧就判定解码器卡死（毫秒）。
-         *
-         * 取 800ms：正常 60fps 下每 16ms 就该出一帧，静止画面下 Source 仍会持续发 P 帧
-         * （码率约 2Mbps，实测 229 包/秒），所以 800ms 无输出一定是卡死而不是「没画面」。
-         * 留足余量是为了避开开机首个 IDR 之前的空窗和偶发 GC 抖动。
-         */
-        const val STALL_TIMEOUT_MS = 800L
-
-        /**
-         * 判定卡死前，至少要有这么多帧被**成功排入**解码器却没有换来任何输出。
-         *
-         * 取 20：60fps 下约 330ms 的输入量，远小于 800ms 时间阈值，所以真正起作用的是时间；
-         * 这个下限只是防止「刚灌了一两帧就判死」的边界抖动。更关键的是它排除了
-         * 「一直在丢弃、从未真正喂进数据」的情形 —— 那是没数据，不是卡死。
-         */
-        const val STALL_MIN_INPUTS = 20
-
-        /** 释放时等待输出线程退出的上限；超时说明它卡在 native 层，改用延迟回收。 */
-        private const val RELEASE_JOIN_MS = 500L
+        private const val INPUT_BUFFER_TIMEOUT_US = 100_000L
 
         /**
          * Parses the H.264 SPS NAL unit to extract the actual video resolution.

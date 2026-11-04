@@ -16,59 +16,17 @@ import java.io.File
  * 没有 root 时全部方法安全失败并返回 false —— Miracast 发现不了，其余投屏方式不受影响。
  */
 object WfdRootHelper {
+    enum class AdvertiseResult { COMMAND_SENT, ROOT_UNAVAILABLE, HELPER_MISSING, SOCKET_UNAVAILABLE, COMMAND_FAILED }
 
     private const val BINARY_NAME = "libwfdctl.so"
 
-    /**
-     * wpa_supplicant 控制 socket 所在目录，按新旧系统顺序尝试。
-     *
-     * 注意这里只给目录，具体用哪个 socket 靠 [resolveSocketPath] 动态枚举。
-     * 早期版本把接口名硬编码成 `p2p0`，但不同厂商的命名完全不同：
-     *   - 老机型 / 标准实现：p2p0
-     *   - Amlogic / 展锐等定制 ROM：p2p-dev-wlan0 + p2p-wlan0-N（N 每次建组都变）
-     * 硬编码会导致兜底落到 wlan0 —— 那是 STA 接口，写入后 WFD IE 只进全局配置，
-     * P2P 接口上拿不到，Source 的 Provision Discovery 请求就永远等不到应答。
-     */
-    private val CTRL_SOCKET_DIRS = listOf(
-        "/data/vendor/wifi/wpa/sockets",
-        "/data/misc/wifi/sockets"
+    /** wpa_supplicant 控制 socket 的常见位置，按新旧顺序尝试。 */
+    private val CTRL_SOCKET_PATHS = listOf(
+        "/data/vendor/wifi/wpa/sockets/p2p0",
+        "/data/misc/wifi/sockets/p2p0",
+        "/data/vendor/wifi/wpa/sockets/wlan0",
+        "/data/misc/wifi/sockets/wlan0"
     )
-
-    /**
-     * 解析实际可用的控制 socket。
-     *
-     * 优先级：p2p-dev-* > p2p0 > p2p-wlan0-N > wlan0。
-     * 实测（Amlogic S905L3 + 展锐 WiFi）：写 p2p-dev-wlan0 之后，wpa_supplicant
-     * 会自动把 WFD_SUBELEM 同步到所有 p2p-wlan0-N（GO）接口，因此只需要命中它。
-     */
-    private fun resolveSocketPath(context: Context): String? {
-        // 关掉动态枚举时退回改前的硬编码行为，用于验证「socket 命名差异」
-        // 到底是不是某些设备连不上的原因（见 [MiracastTuning.isSocketPathDynamic]）
-        if (!MiracastTuning.isSocketPathDynamic(context)) {
-            for (dir in CTRL_SOCKET_DIRS) {
-                if (runAsRoot("test -S $dir/p2p0")) return "$dir/p2p0"
-            }
-            for (dir in CTRL_SOCKET_DIRS) {
-                if (runAsRoot("test -S $dir/wlan0")) return "$dir/wlan0"
-            }
-            return null
-        }
-
-        for (dir in CTRL_SOCKET_DIRS) {
-            val listing = runAsRootOutput("ls -1 $dir 2>/dev/null") ?: continue
-            val names = listing.lines().map { it.trim() }.filter { it.isNotEmpty() }
-
-            // p2p-dev-*：P2P device 接口，写入后会同步到 GO 接口，最优选
-            names.firstOrNull { it.startsWith("p2p-dev") }?.let { return "$dir/$it" }
-            names.firstOrNull { it == "p2p0" }?.let { return "$dir/$it" }
-            names.firstOrNull { it.startsWith("p2p-wlan") }?.let { return "$dir/$it" }
-        }
-        // 最后才退回 STA 接口：能广播 WFD IE，但 P2P 握手仍然不可用
-        for (dir in CTRL_SOCKET_DIRS) {
-            if (runAsRoot("test -S $dir/wlan0")) return "$dir/wlan0"
-        }
-        return null
-    }
 
     /**
      * WFD 设备信息子元素（子元素 0），共 6 字节负载：
@@ -86,17 +44,21 @@ object WfdRootHelper {
      * @param controlPort 我们在 IE 里宣告的 RTSP 控制端口（WFD 标准 7236）
      * @return 是否成功执行（不代表 Windows 一定能发现，还取决于驱动是否支持 sink 模式）
      */
-    fun advertiseSink(context: Context, controlPort: Int = 7236): Boolean {
+    fun advertiseSink(context: Context, controlPort: Int = 7236): Boolean =
+        advertiseSinkResult(context, controlPort) == AdvertiseResult.COMMAND_SENT
+
+    fun advertiseSinkResult(context: Context, controlPort: Int = 7236): AdvertiseResult {
+        if (!isRootAvailable()) return AdvertiseResult.ROOT_UNAVAILABLE
         val binary = File(context.applicationInfo.nativeLibraryDir, BINARY_NAME)
         if (!binary.exists()) {
             Timber.w("WFD: $BINARY_NAME not found in nativeLibraryDir")
-            return false
+            return AdvertiseResult.HELPER_MISSING
         }
 
-        val socketPath = resolveSocketPath(context)
+        val socketPath = CTRL_SOCKET_PATHS.firstOrNull { runAsRoot("ls $it") }
         if (socketPath == null) {
-            Timber.w("WFD: no wpa_supplicant control socket found (no root?)")
-            return false
+            Timber.w("WFD: no accessible wpa_supplicant control socket found")
+            return AdvertiseResult.SOCKET_UNAVAILABLE
         }
 
         val cmd = "${binary.absolutePath} $socketPath " +
@@ -105,10 +67,10 @@ object WfdRootHelper {
 
         return if (runAsRoot(cmd)) {
             Timber.i("WFD: sink IE injected via $socketPath (control port $controlPort)")
-            true
+            AdvertiseResult.COMMAND_SENT
         } else {
-            Timber.w("WFD: failed to inject sink IE — device may not be rooted")
-            false
+            Timber.w("WFD: sink IE command failed or timed out after root authorization")
+            AdvertiseResult.COMMAND_FAILED
         }
     }
 
@@ -116,36 +78,21 @@ object WfdRootHelper {
     fun stopAdvertising(context: Context): Boolean {
         val binary = File(context.applicationInfo.nativeLibraryDir, BINARY_NAME)
         if (!binary.exists()) return false
-        val socketPath = resolveSocketPath(context) ?: return false
+        val socketPath = CTRL_SOCKET_PATHS.firstOrNull { runAsRoot("ls $it") } ?: return false
         return runAsRoot("${binary.absolutePath} $socketPath \"SET wifi_display 0\"")
     }
 
     /** 设备是否可用 root（用于 UI 提示 Miracast 是否可能工作）。 */
-    fun isRootAvailable(): Boolean = runAsRoot("id")
+    fun isRootAvailable(): Boolean = runAsRoot("test \"$(id -u)\" = 0")
 
     private fun runAsRoot(command: String): Boolean = try {
         val process = ProcessBuilder("su", "-c", command)
             .redirectErrorStream(true)
             .start()
-        val output = process.inputStream.bufferedReader().readText().trim()
-        val exit = process.waitFor()
-        if (output.isNotEmpty()) Timber.d("WFD root: $output")
-        exit == 0
+        waitForRootCommand(process)
     } catch (e: Exception) {
+        if (e is InterruptedException) Thread.currentThread().interrupt()
         Timber.d("WFD root unavailable: ${e.message}")
         false
-    }
-
-    /** 同 [runAsRoot]，但返回命令输出（用于枚举 socket 目录）。 */
-    private fun runAsRootOutput(command: String): String? = try {
-        val process = ProcessBuilder("su", "-c", command)
-            .redirectErrorStream(true)
-            .start()
-        val output = process.inputStream.bufferedReader().readText().trim()
-        process.waitFor()
-        output
-    } catch (e: Exception) {
-        Timber.d("WFD root unavailable: ${e.message}")
-        null
     }
 }

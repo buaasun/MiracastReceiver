@@ -40,6 +40,8 @@
   - VLC Player
   - Emby、Plex 等媒体服务器
 
+- **Google Cast 媒体接收（实验性）**：复用 ExoPlayer 播放 HTTP/HTTPS 音视频，支持播放、暂停、跳转、音量和状态回传。仅实现 Default Media Receiver；不支持 Google 设备证书验证、YouTube 专用协议或屏幕镜像。详见 [能力范围与测试方法](MiracastReceiver/GOOGLE-CAST.md)。
+
 - **🖥️ Miracast/WFD**：Windows 无线显示器与安卓手机系统「投屏」共用的协议（**部分电视需要 root**，见[已知问题](#-已知问题)）
   - 完整 RTSP 会话协商（M1–M7）
   - MPEG-2 TS 解复用 + H.264 硬解码，直送 MediaCodec 低延迟渲染
@@ -137,6 +139,7 @@ cd MiracastReceiver
 
 ### 📖 文档
 
+- [ADB 故障日志采集教程](ADB故障日志采集教程.md) - 故障复现、电视 / 盒子日志采集与 Issue 反馈要求
 - [开发与调试指南](开发与调试指南.md) - 完整的开发、打包、安装和调试说明
 - [Windows 无线投屏 Root 配置说明](Windows无线投屏Root配置说明.md) - Miracast 启用步骤、协议实现要点与排错
 - [Windows 无线显示器](Windows无线显示器支持说明.md) - Miracast 协议背景说明
@@ -154,6 +157,7 @@ cd MiracastReceiver
 ### 🙏 致谢与参考
 
 - AirPlay 屏幕镜像实现借鉴并参考了 [PhairPlay](https://github.com/mazer666/PhairPlay) 项目的协议流程与实现思路。
+- Google Cast 媒体接收参考了 [openchromecast](https://github.com/yukarikaname/openchromecast) 的协议定义与实现流程，保留其 MIT 许可声明。
 
 ### 🐛 已知问题
 
@@ -217,6 +221,8 @@ cd MiracastReceiver
   - Windows Media Player
   - VLC Player
   - Emby, Plex media servers
+
+- **Experimental Google Cast media receiver**: HTTP/HTTPS audio/video through ExoPlayer with playback controls and status feedback. Implements the Default Media Receiver; Google device-certificate validation, YouTube-specific protocols and screen mirroring are unsupported. See [scope and testing](MiracastReceiver/GOOGLE-CAST.md).
 
 - **🖥️ Miracast/WFD**: The protocol behind both Windows Wireless Display and Android's built-in screen casting (**root required on some TVs**, see [Known Issues](#-known-issues))
   - Full RTSP session negotiation (M1–M7)
@@ -332,6 +338,7 @@ Output APKs: `app/build/outputs/apk/`
 ### 🙏 Acknowledgements & References
 
 - AirPlay screen mirroring is inspired by and references the protocol flow and implementation ideas from [PhairPlay](https://github.com/mazer666/PhairPlay).
+- Google Cast media reception references [openchromecast](https://github.com/yukarikaname/openchromecast), with its MIT copyright and license retained.
 
 ### 🐛 Known Issues
 
@@ -388,3 +395,16 @@ This project is licensed under the MIT License - see [LICENSE](LICENSE) file for
 ## ⭐ Star History
 
 If you find this project helpful, please give it a star!
+
+## 🙏 贡献者感谢 / Contributors
+
+感谢以下贡献者为项目贡献代码、功能改进和设备验证，也感谢所有提交问题、提供日志和参与测试的朋友。
+
+Thanks to the following contributors for their code, improvements, and device testing, and to everyone who reports issues, shares logs, and helps test the app.
+
+| 贡献者 / Contributor | 贡献 / Contributions |
+| --- | --- |
+| [@arjuntam](https://github.com/arjuntam) | 横屏双栏布局、投屏退出行为设置及设备验证（[#28](https://github.com/weekdayjast/MiracastReceiver/pull/28)、[#29](https://github.com/weekdayjast/MiracastReceiver/pull/29)） / Landscape layout, configurable exit behavior, and device testing |
+| [@Googler0825](https://github.com/Googler0825) | 4K AirPlay HEVC 协商、解码与设备验证（[#26](https://github.com/weekdayjast/MiracastReceiver/pull/26)） / 4K AirPlay HEVC negotiation, decoding, and device testing |
+
+[查看完整贡献者名单 / View all contributors](https://github.com/weekdayjast/MiracastReceiver/graphs/contributors)

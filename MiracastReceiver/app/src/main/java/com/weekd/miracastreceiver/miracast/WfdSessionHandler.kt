@@ -40,7 +40,6 @@ class WfdSessionHandler(
     private var sessionId = ""
     private var presentationUrl = ""
     private var playRequested = false
-    private var setupSent = false            // 已发出 SETUP，等待其响应
 
     var onSessionEstablished: ((sessionId: String) -> Unit)? = null
     var onStreamStart: ((rtpPort: Int) -> Unit)? = null
@@ -87,6 +86,9 @@ class WfdSessionHandler(
 
     // ─── 读取一条完整 RTSP 消息（头部 + 按 Content-Length 读 body）────────────
     private fun readMessage(): String? {
+        // 握手失败的 Source 可能一直不关闭 TCP。不能永久占住唯一的会话循环。
+        // 正常播放时保留更长时间，允许 Source 按协议发送 keep-alive。
+        socket.soTimeout = if (sessionId.isEmpty()) 15_000 else 90_000
         val buf = StringBuilder()
         val one = ByteArray(1)
 
@@ -120,9 +122,6 @@ class WfdSessionHandler(
         Timber.v("WFD >> full:\n$msg")
         return msg
     }
-
-    /** 保护 [send]：解码线程会主动请求 IDR，与读循环的响应写并发。 */
-    private val sendLock = Any()
 
     private fun send(msg: String) {
         Timber.d("WFD << ${msg.lineSequence().first()}")
@@ -186,32 +185,10 @@ class WfdSessionHandler(
 
     // ─── 处理 Source 对我们请求的响应 ────────────────────────────────────────
     private fun handleResponse(msg: String) {
-        // 响应码必须校验：SETUP 失败时 Source 会回 4xx/5xx，且往往不带 Session 头。
-        // 旧实现只看 Session 头，失败时静默跳过 —— 会话卡死但日志里看不出任何异常。
-        val statusLine = msg.lineSequence().firstOrNull().orEmpty()
-        val statusCode = statusLine.split(' ').getOrNull(1)?.toIntOrNull()
-        val isOk = statusCode != null && statusCode in 200..299
-
-        if (!isOk) {
-            Timber.e("WFD: source returned $statusLine (SETUP sent=$setupSent)")
-            if (setupSent) {
-                Timber.e("WFD: SETUP rejected — check Transport header formatting")
-                onStreamStop?.invoke()
-                close()
-            }
-            return
-        }
-
         val session = header(msg, "Session")?.substringBefore(';')
-        if (setupSent && sessionId.isEmpty()) {
-            // SETUP 的 200 响应：拿到 Session ID 后发 PLAY
-            setupSent = false
-            if (session.isNullOrBlank()) {
-                Timber.w("WFD: SETUP 200 but no Session header — continuing without it")
-            } else {
-                sessionId = session
-                Timber.i("WFD: session id = $sessionId")
-            }
+        if (!session.isNullOrBlank() && sessionId.isEmpty()) {
+            sessionId = session
+            Timber.i("WFD: session id = $sessionId")
             onSessionEstablished?.invoke(sessionId)
             sendPlay()                                           // M7
         } else if (playRequested) {
@@ -219,8 +196,6 @@ class WfdSessionHandler(
             onStreamStart?.invoke(rtpPort)
             startPlayerActivity()
             playRequested = false
-        } else {
-            Timber.d("WFD: response $statusLine (no pending action)")
         }
     }
 
@@ -235,21 +210,10 @@ class WfdSessionHandler(
         if (presentationUrl.isEmpty()) {
             presentationUrl = "rtsp://${socket.inetAddress.hostAddress}/wfd1.0/streamid=0"
         }
-        // RFC 2326 §12.39 的语法是 `client_port = port [ "-" port ]`，第二个端口可选；
-        // 但语义上它是 RTP/RTCP 端口对。实测 Windows 11 会往 RTCP 端口发
-        // `MF_SEND_RATE@0.0.0.0:0` 私有扩展包，只声明单端口时是否影响推流尚未确认，
-        // 因此做成开关（见 [MiracastTuning.isDualClientPort]）以便同机对比。
-        val ports = if (MiracastTuning.isDualClientPort(context)) {
-            "$rtpPort-${rtpPort + 1}"
-        } else {
-            "$rtpPort"
-        }
-        setupSent = true
-        Timber.i("WFD: SETUP client_port=$ports")
         send(
             "SETUP $presentationUrl RTSP/1.0\r\n" +
                 "CSeq: ${++outCseq}\r\n" +
-                "Transport: RTP/AVP/UDP;unicast;client_port=$ports\r\n\r\n"
+                "Transport: RTP/AVP/UDP;unicast;client_port=$rtpPort\r\n\r\n"
         )
     }
 
@@ -260,39 +224,6 @@ class WfdSessionHandler(
                 "CSeq: ${++outCseq}\r\n" +
                 "Session: $sessionId\r\n\r\n"
         )
-    }
-
-    /**
-     * 请求 Source 立刻发一个 IDR（WFD 规范里的 M-feedback 机制）。
-     *
-     * 解码器重建后必须从 IDR 开始解，否则只能等 Source 的下一个自然 GOP —— 实测 Windows
-     * 的 GOP 约 2~3 秒，期间画面完全静止。主动要一个能把这个恢复窗口压到几百毫秒。
-     *
-     * 从接收线程调用（不是 RTSP 读循环所在的线程），[send] 不是线程安全的，
-     * 所以这里显式加锁，且失败只记日志不抛 —— 拿不到 IDR 只是慢一点，不该影响会话。
-     *
-     * @return true 表示请求已写入 socket（不代表 Source 真的会响应该参数）
-     */
-    fun requestIdr(): Boolean {
-        if (sessionId.isEmpty()) return false
-        return try {
-            synchronized(sendLock) {
-                val body = "wfd_idr_request\r\n"
-                send(
-                    "SET_PARAMETER $presentationUrl RTSP/1.0\r\n" +
-                        "CSeq: ${++outCseq}\r\n" +
-                        "Session: $sessionId\r\n" +
-                        "Content-Type: text/parameters\r\n" +
-                        "Content-Length: ${body.toByteArray(StandardCharsets.UTF_8).size}\r\n\r\n" +
-                        body
-                )
-            }
-            Timber.i("WFD: requested IDR from source")
-            true
-        } catch (e: Exception) {
-            Timber.w("WFD: IDR request failed (${e.message})")
-            false
-        }
     }
 
     // ─── 响应构造 ───────────────────────────────────────────────────────────
@@ -349,6 +280,16 @@ class WfdSessionHandler(
             socket.close()
         } catch (e: Exception) {
             Timber.e(e, "Error closing WFD session socket")
+        }
+    }
+
+    fun disconnectSender() {
+        try {
+            if (sessionId.isNotEmpty()) send(
+                "TEARDOWN $presentationUrl RTSP/1.0\r\nCSeq: ${++outCseq}\r\nSession: $sessionId\r\n\r\n"
+            )
+        } finally {
+            close()
         }
     }
 }

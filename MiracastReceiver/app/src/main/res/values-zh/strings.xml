@@ -1,20 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="auto_rotate_to_fit">自动旋转适配屏幕</string>
     <!-- 首页 -->
     <string name="waiting_connection">等待投屏连接...</string>
     <string name="device_ip">设备 IP: %s</string>
     <string name="device_ip_fetching">获取中...</string>
     <string name="how_to_connect">如何连接</string>
     <string name="connect_instruction">1. 确保发送设备与电视在同一局域网\n2. 打开发送端应用\n3. 扫描并选择此设备\n4. 开始投屏</string>
-
-    <!-- 调试选项（仅 debug 构建显示） -->
-    <string name="debug_settings_title">调试选项</string>
-    <string name="debug_settings_hint">仅 debug 版可见。用于在同一台设备上逐项开关，对比哪项改动是必需的；改动在下次投屏会话生效。</string>
-    <string name="tuning_dual_client_port">SETUP 声明 RTCP 端口</string>
-    <string name="tuning_rtcp_port">绑定并消费 RTCP 端口</string>
-    <string name="tuning_socket_dynamic">动态枚举 wpa_supplicant socket</string>
     <string name="auto_start_on_boot">开机自动启动接收服务</string>
     <string name="auto_start_on_boot_hint">电视开机后在后台自动运行，无需手动打开本应用。部分电视需要在系统设置里允许本应用自启动。</string>
+    <string name="return_to_app_after_cast">投屏结束后回到本应用</string>
+    <string name="return_to_app_after_cast_hint">停止投屏后停在设置页，而不是回到电视桌面。适合投完屏就要接着调设置的情况。</string>
     <string name="language">语言</string>
     <string name="language_follow_system">跟随系统</string>
     <string name="status_no_network">网络未连接</string>
@@ -98,4 +94,16 @@
     <string name="notification_channel_name">投屏接收服务</string>
     <string name="notification_channel_description">保持投屏接收服务运行</string>
     <string name="notification_waiting">正在等待 AirPlay/DLNA/Miracast 投屏连接</string>
+    <string name="notification_stop_cast">停止投屏</string>
+    <string name="status_waiting_network">正在等待网络地址，请检查网络连接。</string>
+    <string name="status_receiver_running">接收服务已运行，等待投屏连接。</string>
+    <string name="status_receiver_stopped">接收服务已停止，请重新打开应用重试。</string>
+    <string name="status_miracast_checking">正在检查 Windows / 安卓屏幕镜像功能…</string>
+    <string name="status_miracast_advertising">Miracast 发现功能已配置。Windows 请按 Win+K，安卓请打开无线投屏；能否被发现还取决于设备驱动。</string>
+    <string name="status_miracast_system">系统 Wi-Fi Display 开关已开启。如 Win+K 中仍找不到本机，请打开系统自带的屏幕镜像接收功能再试；开关开启不代表设备一定支持接收。</string>
+    <string name="status_miracast_root_required">Windows / 安卓屏幕镜像暂不可用：未获得 root 授权。如设备自带屏幕镜像接收功能，请先开启；否则需 root 才能启用发现。仍可使用 AirPlay、DLNA 或 VLC 投屏。</string>
+    <string name="status_miracast_failed">Windows / 安卓屏幕镜像配置未成功。请检查系统屏幕镜像、Wi-Fi Direct 支持和 root 授权，重新打开应用重试；仍失败请提供 ADB 日志。其他投屏方式仍可使用。</string>
+    <string name="status_miracast_unsupported">此设备未提供 Wi-Fi Direct，无法使用 Windows / 安卓屏幕镜像。可改用 AirPlay、DLNA 或 VLC 投屏。</string>
+    <string name="status_miracast_permission">Windows / 安卓屏幕镜像需要“附近的设备”或定位权限。请在系统应用设置中允许后重新打开应用。</string>
+    <string name="status_miracast_wifi_disabled">Windows / 安卓屏幕镜像需要 Wi-Fi Direct。请开启 Wi-Fi 后重新打开应用，仅连接网线不足以使用此功能。</string>
 </resources>

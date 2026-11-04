@@ -30,15 +30,30 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build Debug APK (ARM32)
+      - name: Unit tests and Debug/Release APKs (ARM32)
         working-directory: MiracastReceiver
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug -PbuildArm32 --no-daemon --stacktrace
+          ./gradlew testDebugUnitTest assembleDebug assembleRelease -PbuildArm32 --no-daemon --stacktrace
+
+      - name: Upload unit test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: miracast-unit-test-results
+          path: MiracastReceiver/app/build/test-results/testDebugUnitTest/*.xml
+          if-no-files-found: ignore
 
       - name: Upload ARM32 APK
         uses: actions/upload-artifact@v4
         with:
           name: miracast-debug-arm32
           path: MiracastReceiver/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload ARM32 Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: miracast-release-arm32
+          path: MiracastReceiver/app/build/outputs/apk/release/*.apk
           if-no-files-found: error

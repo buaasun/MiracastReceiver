@@ -9,10 +9,16 @@ import android.content.Context
  * 内部用的 prefs 文件分开，避免清配对时误删用户设置。
  */
 object AppSettings {
+    fun isAutoRotateToFit(context: Context): Boolean = prefs(context).getBoolean("auto_rotate_to_fit", false)
+
+    fun setAutoRotateToFit(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean("auto_rotate_to_fit", enabled).apply()
+    }
 
     private const val PREFS_NAME = "miracast_settings"
     private const val KEY_AUTO_START_ON_BOOT = "auto_start_on_boot"
     private const val KEY_LANGUAGE = "language"
+    private const val KEY_RETURN_TO_APP_AFTER_CAST = "return_to_app_after_cast"
 
     /**
      * 是否开机自动启动接收服务。
@@ -35,7 +41,19 @@ object AppSettings {
         prefs(context).edit().putString(KEY_LANGUAGE, tag).apply()
     }
 
-    /** 供 [com.weekd.miracastreceiver.miracast.MiracastTuning] 等模块复用的同一份 prefs。 */
-    fun prefs(context: Context) =
+    /**
+     * 投屏结束（遥控器返回键 / 手机端停止）后，是否留在本应用的设置页。
+     *
+     * 默认关闭：退出投屏就回到电视桌面，这是多数人投完屏想继续看电视的路径。
+     * 打开后停在设置页，适合需要接着调设置（自启、语言）或确认接收状态的人。
+     */
+    fun isReturnToAppAfterCast(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_RETURN_TO_APP_AFTER_CAST, false)
+
+    fun setReturnToAppAfterCast(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_RETURN_TO_APP_AFTER_CAST, enabled).apply()
+    }
+
+    private fun prefs(context: Context) =
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 }
