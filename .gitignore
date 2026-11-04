@@ -119,5 +119,3 @@ tools/wfdsink
 
 # Python Cast diagnostic scripts
 tools/__pycache__/
-.memsearch/
-/PROGRESS.md
