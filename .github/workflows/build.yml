@@ -30,6 +30,9 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: MainActivity layout bindings
+        run: python3 -m unittest discover -s tools -p test_main_activity_layouts.py -v
+
       - name: Unit tests and Debug/Release APKs (ARM32)
         working-directory: MiracastReceiver
         run: |
