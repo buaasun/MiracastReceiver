@@ -16,11 +16,11 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.weekd.miracastreceiver"
+        applicationId = "com.weekd.miracastreceiver.casttest"
         minSdk = 21
         targetSdk = 36
         versionCode = 16
-        versionName = "1.2.11"
+        versionName = "1.2.11-casttest"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
