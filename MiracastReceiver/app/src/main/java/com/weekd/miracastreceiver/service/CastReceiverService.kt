@@ -31,6 +31,7 @@ import com.weekd.miracastreceiver.dlna.DlnaMediaRenderer
 import com.weekd.miracastreceiver.dlna.SsdpServer
 import com.weekd.miracastreceiver.dlna.UpnpHttpServer
 import com.weekd.miracastreceiver.miracast.WfdRootHelper
+import com.weekd.miracastreceiver.miracast.NativePbcDiagnostic
 import com.weekd.miracastreceiver.miracast.WfdServer
 import com.weekd.miracastreceiver.miracast.WifiDirectManager
 import com.weekd.miracastreceiver.util.AppLanguage
@@ -72,6 +73,7 @@ class CastReceiverService : Service() {
     private lateinit var upnpHttpServer: UpnpHttpServer
     private lateinit var wfdServer: WfdServer
     private lateinit var wifiDirectManager: WifiDirectManager
+    private val nativePbcDiagnostic by lazy { NativePbcDiagnostic(this) { cb -> wifiDirectManager.queryCurrentGroup(cb) } }
     /** startAllServices() 已执行；防止重复 onStartCommand 再建一套接收器。 */
     private var servicesStarted = false
     private lateinit var deviceUuid: String
@@ -299,9 +301,15 @@ class CastReceiverService : Service() {
             }
             onGroupCreated = { group ->
                 Timber.i("Wi-Fi Direct group created for Miracast: ${group.networkName}")
+                if (!stopping) nativePbcDiagnostic.onGroup(group)
                 p2pGroupReady = true
                 p2pFailure = null
                 advertiseMiracast()
+            }
+            onCurrentGroup = { group ->
+                if (!stopping) {
+                    if (group == null) nativePbcDiagnostic.stop() else nativePbcDiagnostic.onGroup(group)
+                }
             }
             onDeviceConnected = { device ->
                 Timber.i("Miracast device connected: ${device.deviceName}")
@@ -650,6 +658,7 @@ class CastReceiverService : Service() {
      */
     private fun shutdownMiracast() {
         stopping = true
+        nativePbcDiagnostic.stop()
         rootAdvertisingActive = false
         runCatching { wfdServer.stop() }
         if (rootAdvertisingAttempted) {

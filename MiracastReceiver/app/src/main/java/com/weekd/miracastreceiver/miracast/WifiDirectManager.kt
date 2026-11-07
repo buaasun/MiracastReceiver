@@ -48,6 +48,14 @@ class WifiDirectManager(
     var onDeviceConnected: ((WifiP2pDevice) -> Unit)? = null
     var onDeviceDisconnected: (() -> Unit)? = null
     var onGroupCreated: ((WifiP2pGroup) -> Unit)? = null
+    var onCurrentGroup: ((WifiP2pGroup?) -> Unit)? = null
+    private var groupQueryGeneration = 0L
+
+    fun queryCurrentGroup(callback: (WifiP2pGroup?) -> Unit) {
+        val ch = channel
+        if (ch == null || manager == null || !isStarted) { callback(null); return }
+        try { manager?.requestGroupInfo(ch) { callback(it) } } catch (_: Exception) { callback(null) }
+    }
 
     fun start() {
         if (isStarted) {
@@ -338,6 +346,10 @@ class WifiDirectManager(
 
                     WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
                         Timber.d("Wi-Fi P2P connection changed")
+                        val generation = ++groupQueryGeneration
+                        queryCurrentGroup { group ->
+                            if (generation == groupQueryGeneration) onCurrentGroup?.invoke(group)
+                        }
                         channel?.let { ch ->
                             manager?.requestConnectionInfo(ch) { info ->
                                 if (info.groupFormed) {
