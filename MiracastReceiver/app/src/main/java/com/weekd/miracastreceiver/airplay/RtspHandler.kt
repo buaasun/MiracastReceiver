@@ -24,8 +24,8 @@ import java.util.concurrent.Executors
  */
 open class RtspHandler(
     private val context: android.content.Context,
-    private val displayWidth: Int = 1920,
-    private val displayHeight: Int = 1080,
+    displayWidth: Int = 1920,
+    displayHeight: Int = 1080,
     private val audioEnabled: Boolean = false,
     private val videoSurfaceProvider: () -> android.view.Surface?,
     private val onStreamingStarted: (session: SessionDescription) -> Unit,
@@ -80,6 +80,13 @@ open class RtspHandler(
     /** Shows ([pin]) or hides (null) the on-screen pairing PIN during SRP pair-setup. */
     private val onShowPin: (pin: String?) -> Unit = {}
 ) {
+    @Volatile internal var displayResolution: Pair<Int, Int> = displayWidth to displayHeight
+        private set
+
+    fun updateDisplayResolution(width: Int, height: Int) {
+        require(width > 0 && height > 0)
+        displayResolution = width to height
+    }
 
     // ─── Legacy AirPlay SRP PIN pairing (only used when pinAuthEnabled) ───────
     @Volatile private var legacyPin: com.weekd.miracastreceiver.airplay.handshake.LegacyPairSetupPin? = null
@@ -171,6 +178,7 @@ open class RtspHandler(
         activeClient = null
         serverSocket = null
         synchronized(reverseLock) { runCatching { reverseSocket?.close() }; reverseSocket = null }
+        if (mlhlsRelayDelegate.isInitialized()) mlhlsRelay.close()
         eventExecutor.shutdown()
         Logger.i("RTSP handler stopped")
     }
@@ -375,6 +383,7 @@ open class RtspHandler(
             )
         }
         "POST /action" -> {
+            runCatching { mlhlsRelay.action(PlistCodec.decode(request.bodyBytes)) }
             Logger.d("POST /action body: ${describePlist(request.bodyBytes)}")
             RtspResponse(200, "OK", protocol = request.responseProtocol())
         }
@@ -418,6 +427,25 @@ open class RtspHandler(
      * sender over the /reverse channel. Safe from any thread (MediaPlayer calls back on the main
      * thread, where socket writes are forbidden) — writes happen on a single ordered worker.
      */
+    private val mlhlsRelayDelegate = lazy { MlhlsRelay { sendReverseEvent(it) } }
+    private val mlhlsRelay by mlhlsRelayDelegate
+    @Volatile private var videoItemUuid: String? = null
+
+    private fun sendReverseEvent(values: Map<String, Any?>) {
+        eventExecutor.execute {
+            synchronized(reverseLock) {
+                val socket = reverseSocket ?: return@synchronized
+                runCatching {
+                    val body = PlistCodec.encodeXml(values)
+                    val sessionHeader = reverseSessionId?.let { "X-Apple-Session-ID: $it\r\n" } ?: ""
+                    val head = "POST /event HTTP/1.1\r\nContent-Type: text/x-apple-plist+xml\r\n${sessionHeader}Content-Length: ${body.size}\r\n\r\n"
+                    socket.getOutputStream().apply { write(head.toByteArray(Charsets.US_ASCII)); write(body); flush() }
+                    Logger.i("AirPlay reverse request type=${values["type"]}")
+                }.onFailure { Logger.w("AirPlay reverse request failed: ${it.message}") }
+            }
+        }
+    }
+
     fun sendVideoEvent(state: String) {
         runCatching {
             eventExecutor.execute {
@@ -428,7 +456,9 @@ open class RtspHandler(
                         return@synchronized
                     }
                     runCatching {
-                        val body = PlistCodec.encodeXml(mapOf("category" to "video", "sessionID" to 1, "state" to state))
+                        val values = mutableMapOf<String, Any?>("category" to "video", "sessionID" to 1, "state" to state)
+                        videoItemUuid?.let { values["params"] = mapOf("uuid" to it) }
+                        val body = PlistCodec.encodeXml(values)
                         val head = StringBuilder()
                             .append("POST /event HTTP/1.1\r\n")
                             .append("Content-Type: text/x-apple-plist+xml\r\n")
@@ -529,7 +559,7 @@ open class RtspHandler(
         Logger.i("POST /play url=$url start=$start")
         Logger.i("POST /play body: ${describePlist(request.bodyBytes)}")
         val scheme = url.substringBefore(':', "").lowercase()
-        if (scheme != "http" && scheme != "https") {
+        if (scheme != "http" && scheme != "https" && scheme != "mlhls") {
             // e.g. mlhls://localhost/… (HLS relayed through the sender via /reverse + FCUP, used by
             // YouTube and some web players) — not implemented. Accepting it would leave both the
             // TV and the phone black, so refuse and tell the sender playback has stopped.
@@ -541,7 +571,12 @@ open class RtspHandler(
         val startSeconds = if (request.isPlistBody()) {
             runCatching { PlistCodec.decode(request.bodyBytes)["Start-Position-Seconds"] as? Double }.getOrNull()
         } else null
-        onVideoPlay(url, start, startSeconds)
+        videoItemUuid = if (request.isPlistBody()) runCatching { PlistCodec.decode(request.bodyBytes)["uuid"] as? String }.getOrNull() else null
+        val playbackUrl = if (scheme == "mlhls") {
+            if (!url.startsWith("mlhls://localhost/")) return RtspResponse(400, "Bad Request", protocol = request.responseProtocol())
+            mlhlsRelay.play(url, request.header("X-Apple-Session-ID") ?: reverseSessionId ?: "")
+        } else url
+        onVideoPlay(playbackUrl, start, startSeconds)
         return RtspResponse(200, "OK", protocol = request.responseProtocol())
     }
 
@@ -592,6 +627,7 @@ open class RtspHandler(
     /** POST /stop — stop URL playback. */
     private fun handleVideoStop(request: RtspRequest): RtspResponse {
         Logger.i("POST /stop (video URL)")
+        if (mlhlsRelayDelegate.isInitialized()) mlhlsRelay.reset()
         onVideoStop()
         return RtspResponse(200, "OK", protocol = request.responseProtocol())
     }
@@ -682,13 +718,16 @@ open class RtspHandler(
     }
 
     /** GET /info — advertises receiver identity + capabilities (binary plist). */
-    private fun handleInfo(request: RtspRequest): RtspResponse = RtspResponse(
+    private fun handleInfo(request: RtspRequest): RtspResponse {
+        val (width, height) = displayResolution
+        return RtspResponse(
         statusCode = 200,
         statusMessage = "OK",
-        bodyBytes = InfoResponder.build(context, displayWidth, displayHeight, pinRequired = pinAuthEnabled),
+        bodyBytes = InfoResponder.build(context, width, height, pinRequired = pinAuthEnabled),
         contentType = "application/x-apple-binary-plist",
         protocol = request.responseProtocol()
-    )
+        )
+    }
 
     /**
      * POST /pair-setup. With PIN auth off (default) this is the anonymous Ed25519 exchange. With PIN

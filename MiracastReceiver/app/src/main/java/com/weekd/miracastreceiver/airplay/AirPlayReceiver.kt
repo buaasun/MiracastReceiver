@@ -49,10 +49,10 @@ import java.net.Socket
 class AirPlayReceiver(
     private val context: Context,
     /** User-configured display name from Settings (blank = use system device name). */
-    private val displayName: String = "",
+    @Volatile private var displayName: String = "",
     /** Advertised mirroring resolution; callers can pass the TV's native display mode. */
-    private val mirrorWidth: Int = 1920,
-    private val mirrorHeight: Int = 1080,
+    mirrorWidth: Int = 1920,
+    mirrorHeight: Int = 1080,
     /** Whether to accept the mirroring audio stream (experimental — see AppSettings.mirrorAudioEnabled). */
     private val audioEnabled: Boolean = false,
     /** Require HomeKit-style SRP PIN pairing before streaming (AppSettings.airPlayPinAuthEnabled). */
@@ -108,6 +108,7 @@ class AirPlayReceiver(
     // Child components
     private var mdnsService: MdnsService? = null
     private var rtspHandler: RtspHandler? = null
+    @Volatile private var mirrorResolution: Pair<Int, Int> = mirrorWidth to mirrorHeight
     private var timingHandler: TimingHandler? = null
     private var videoDecoder: VideoDecoder? = null
     private var audioPlayer: AudioPlayer? = null
@@ -216,6 +217,7 @@ class AirPlayReceiver(
         Logger.d("Timing handler started on UDP port ${TimingHandler.TIMING_PORT}")
     }
 
+    @Synchronized
     private fun startMdnsService() {
         mdnsService = MdnsService(
             context = context,
@@ -225,11 +227,37 @@ class AirPlayReceiver(
         Logger.d("mDNS service started")
     }
 
+    /** Refresh discovery without tearing down an active stream. */
+    @Synchronized
+    fun updateDisplayName(name: String) {
+        displayName = name
+        refreshDisplayName()
+    }
+
+    @Synchronized
+    private fun refreshDisplayName() {
+        try {
+            mdnsService?.restart(displayName.ifBlank { null })
+        } catch (e: Exception) {
+            Logger.e("Failed to refresh AirPlay name", e)
+        }
+    }
+
+    @Synchronized
+    fun updateDisplayResolution(width: Int, height: Int) {
+        require(width > 0 && height > 0)
+        mirrorResolution = width to height
+        rtspHandler?.updateDisplayResolution(width, height)
+        Logger.i("AirPlay display declaration updated: ${width}x$height; sender must re-read /info")
+    }
+
+    @Synchronized
     private fun startRtspHandler() {
+        val (width, height) = mirrorResolution
         rtspHandler = RtspHandler(
             context = context,
-            displayWidth = mirrorWidth,
-            displayHeight = mirrorHeight,
+            displayWidth = width,
+            displayHeight = height,
             audioEnabled = audioEnabled,
             videoSurfaceProvider = videoSurfaceProvider,
             onStreamingStarted = { session -> onStreamingStarted(session) },
@@ -323,7 +351,7 @@ class AirPlayReceiver(
 
         scope.launch {
             try {
-                mdnsService?.restart(displayName.ifBlank { null })
+                refreshDisplayName()
             } catch (e: Exception) {
                 Logger.e("Failed to restart mDNS after streaming", e)
             }
@@ -477,7 +505,8 @@ class AirPlayReceiver(
         val aesKey = mirrorAesKey ?: run { Logger.e("mirror stream start before keys set"); return 0 }
         val ecdhSecret = mirrorEcdhSecret ?: return 0
         mirrorServer?.stop()
-        return MirrorStreamServer(aesKey, ecdhSecret, streamConnectionId, videoSurfaceProvider, mirrorWidth, mirrorHeight)
+        val (width, height) = mirrorResolution
+        return MirrorStreamServer(aesKey, ecdhSecret, streamConnectionId, videoSurfaceProvider, width, height)
             .also { mirrorServer = it; it.start(scope); videoPlaying = true; emitNowPlaying() }
             .dataPort
             .also { Logger.i("Mirror data server started on port $it") }

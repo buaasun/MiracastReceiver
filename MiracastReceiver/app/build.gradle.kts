@@ -19,8 +19,8 @@ android {
         applicationId = "com.weekd.miracastreceiver"
         minSdk = 21
         targetSdk = 36
-        versionCode = 16
-        versionName = "1.2.11"
+        versionCode = 18
+        versionName = "1.2.13"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -87,6 +87,10 @@ android {
 }
 
 dependencies {
+    implementation("com.google.zxing:core:3.5.3")
+    // Experimental Huawei Cast+ receiver. Source/provenance recorded next to the binary.
+    implementation(files("libs/HuaweiCastPlusEngine.jar"))
+
     // AndroidX Core
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")

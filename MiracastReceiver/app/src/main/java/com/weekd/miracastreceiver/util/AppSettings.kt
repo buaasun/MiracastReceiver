@@ -9,6 +9,66 @@ import android.content.Context
  * 内部用的 prefs 文件分开，避免清配对时误删用户设置。
  */
 object AppSettings {
+    const val KEY_RECEIVER_NAME = "receiver_name"
+    const val KEY_AIRPLAY_PORTRAIT_DISPLAY = "airplay_portrait_display"
+
+    fun getMiracastManualRotation(context: Context): Int = prefs(context).getInt("miracast_manual_rotation", 0)
+    fun isMiracastPortraitDisplay(context: Context): Boolean = prefs(context).getBoolean("miracast_portrait_display", false)
+
+    fun setMiracastRotation(context: Context, manual: Int, effective: Int): Boolean {
+        val portrait = effective % 180 != 0
+        val changed = isMiracastPortraitDisplay(context) != portrait
+        if (changed || getMiracastManualRotation(context) != manual) {
+            prefs(context).edit().putInt("miracast_manual_rotation", manual)
+                .putBoolean("miracast_portrait_display", portrait).apply()
+        }
+        return changed
+    }
+
+    fun getCastPlusRotation(context: Context): Int = prefs(context).getInt("castplus_rotation", 0)
+
+    fun setCastPlusRotation(context: Context, rotation: Int) {
+        require(rotation in listOf(0, 90, 180, 270))
+        prefs(context).edit().putInt("castplus_rotation", rotation).apply()
+    }
+
+    fun isAirPlayPortraitDisplay(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_AIRPLAY_PORTRAIT_DISPLAY, false)
+
+    fun getAirPlayManualRotation(context: Context): Int =
+        prefs(context).getInt("airplay_manual_rotation", 0)
+
+    /** Returns true when the declaration changes orientation and requires sender renegotiation. */
+    fun setAirPlayRotation(context: Context, manual: Int, effective: Int): Boolean {
+        val portrait = effective % 180 != 0
+        val changed = isAirPlayPortraitDisplay(context) != portrait
+        if (changed || getAirPlayManualRotation(context) != manual) {
+            prefs(context).edit().putBoolean(KEY_AIRPLAY_PORTRAIT_DISPLAY, portrait)
+                .putInt("airplay_manual_rotation", manual).apply()
+        }
+        return changed
+    }
+
+    fun getReceiverName(context: Context): String =
+        prefs(context).getString(KEY_RECEIVER_NAME, "") ?: ""
+
+    /** Empty means follow the system name. All entry points share the same validation. */
+    fun setReceiverName(context: Context, value: String): Boolean {
+        val name = if (value.isEmpty()) "" else ReceiverName.normalize(value) ?: return false
+        return prefs(context).edit().putString(KEY_RECEIVER_NAME, name).commit()
+    }
+
+    fun observe(context: Context, listener: android.content.SharedPreferences.OnSharedPreferenceChangeListener) =
+        prefs(context).registerOnSharedPreferenceChangeListener(listener)
+
+    fun unobserve(context: Context, listener: android.content.SharedPreferences.OnSharedPreferenceChangeListener) =
+        prefs(context).unregisterOnSharedPreferenceChangeListener(listener)
+
+    fun isCastPlusEnabled(context: Context): Boolean = prefs(context).getBoolean("castplus_enabled", false)
+    fun setCastPlusEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean("castplus_enabled", enabled).apply()
+    }
+
     fun isAutoRotateToFit(context: Context): Boolean = prefs(context).getBoolean("auto_rotate_to_fit", false)
 
     fun setAutoRotateToFit(context: Context, enabled: Boolean) {

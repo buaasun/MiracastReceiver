@@ -3,6 +3,7 @@ package com.weekd.miracastreceiver.ui
 import android.Manifest
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -21,6 +22,7 @@ import com.weekd.miracastreceiver.discovery.DeviceInfoProvider
 import com.weekd.miracastreceiver.discovery.MdnsAdvertiser
 import com.weekd.miracastreceiver.service.CastReceiverService
 import com.weekd.miracastreceiver.service.ReceiverStatus
+import com.weekd.miracastreceiver.castplus.CastPlusReceiver
 import com.weekd.miracastreceiver.util.AppLanguage
 import com.weekd.miracastreceiver.util.AppSettings
 import com.weekd.miracastreceiver.utils.NetworkUtils
@@ -46,6 +48,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var switchAutoStart: SwitchCompat
     private lateinit var switchReturnToApp: SwitchCompat
     private lateinit var tvLanguageValue: TextView
+    private lateinit var deviceNameDialog: DeviceNameDialog
+    private val nameListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == AppSettings.KEY_RECEIVER_NAME) {
+            tvDeviceName.text = deviceInfoProvider.getDeviceName()
+            mdnsAdvertiser.stopMiracastAdvertising()
+            startAdvertising()
+        }
+    }
 
     /** 定位权限弹窗还在时不叠加悬浮窗权限提示，等它有结果再说 */
     private var wifiPermissionPending = false
@@ -78,6 +88,7 @@ class MainActivity : AppCompatActivity() {
 
         initServices()
         initViews()
+        AppSettings.observe(this, nameListener)
         // 切换语言会重建本页（savedInstanceState 非空），这时不要把权限弹窗再弹一遍
         if (savedInstanceState == null) {
             requestWifiDirectPermissions()
@@ -88,7 +99,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun requestWifiDirectPermissions() {
-        val missing = WIFI_DIRECT_PERMISSIONS.filter {
+        val permissions = WIFI_DIRECT_PERMISSIONS.toMutableSet()
+        if (AppSettings.isCastPlusEnabled(this)) permissions += setOf(
+            Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
+        val missing = permissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
         if (missing.isNotEmpty()) {
@@ -176,6 +190,15 @@ class MainActivity : AppCompatActivity() {
         tvDeviceName = findViewById(R.id.tv_device_name)
         tvDeviceIp = findViewById(R.id.tv_device_ip)
         tvStatus = findViewById(R.id.tv_status)
+        findViewById<SwitchCompat>(R.id.switch_castplus).apply {
+            isChecked = AppSettings.isCastPlusEnabled(this@MainActivity)
+            isEnabled = Build.VERSION.SDK_INT >= 23
+            setOnCheckedChangeListener { _, checked ->
+                AppSettings.setCastPlusEnabled(this@MainActivity, checked)
+                if (checked) requestWifiDirectPermissions()
+                startCastService()
+            }
+        }
         tvMiracastStatus = findViewById(R.id.tv_miracast_status)
         startupProgress = findViewById(R.id.startup_progress)
         switchAutoStart = findViewById(R.id.switch_auto_start)
@@ -207,6 +230,8 @@ class MainActivity : AppCompatActivity() {
         // 设置设备名称
         val deviceName = deviceInfoProvider.getDeviceName()
         tvDeviceName.text = deviceName
+        deviceNameDialog = DeviceNameDialog(this)
+        tvDeviceName.setOnClickListener { deviceNameDialog.show() }
     }
 
     /** 第一项是「跟随系统」，其后是 [AppLanguage.OPTIONS]。 */
@@ -290,6 +315,20 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch {
             while (true) {
                 val service = ReceiverStatus.service
+                val castPlus = CastPlusReceiver.current?.state?.value?.status ?: CastPlusReceiver.Status.OFF
+                findViewById<TextView>(R.id.tv_castplus_status).setText(when (castPlus) {
+                    CastPlusReceiver.Status.OFF -> R.string.castplus_off
+                    CastPlusReceiver.Status.UNSUPPORTED -> R.string.castplus_unsupported
+                    CastPlusReceiver.Status.PERMISSION_REQUIRED -> R.string.castplus_permission
+                    CastPlusReceiver.Status.STARTING -> R.string.castplus_starting
+                    CastPlusReceiver.Status.READY -> R.string.castplus_ready
+                    CastPlusReceiver.Status.PAIRING -> R.string.castplus_pairing
+                    CastPlusReceiver.Status.CONNECTING -> R.string.castplus_connecting
+                    CastPlusReceiver.Status.PLAYING -> R.string.castplus_playing
+                    CastPlusReceiver.Status.PAUSED -> R.string.castplus_paused
+                    CastPlusReceiver.Status.DISCONNECTING -> R.string.castplus_disconnecting
+                    CastPlusReceiver.Status.ERROR -> R.string.castplus_error
+                })
                 val miracast = ReceiverStatus.miracast
                 tvStatus.setText(when (service) {
                     ReceiverStatus.Service.STARTING -> R.string.status_service_starting
@@ -317,7 +356,13 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onStop() {
+        deviceNameDialog.close()
+        super.onStop()
+    }
+
     override fun onDestroy() {
+        AppSettings.unobserve(this, nameListener)
         super.onDestroy()
         mdnsAdvertiser.stopAdvertising()
         Timber.i("MainActivity destroyed")

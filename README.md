@@ -42,6 +42,8 @@
 
 - **Google Cast 媒体接收（实验性）**：复用 ExoPlayer 播放 HTTP/HTTPS 音视频，支持播放、暂停、跳转、音量和状态回传。仅实现 Default Media Receiver；不支持 Google 设备证书验证、YouTube 专用协议或屏幕镜像。详见 [能力范围与测试方法](MiracastReceiver/GOOGLE-CAST.md)。
 
+- **华为 Cast+ 支持（实验性）**：在设置中开启后，可接收兼容华为手机的无线投屏，支持连接确认、PIN 码和画面旋转。已在 Sony Android 12 电视验证发现与投屏；其他机型仍需测试。详见 [启用方法与兼容范围](MiracastReceiver/HUAWEI-CASTPLUS.md)。
+
 - **🖥️ Miracast/WFD**：Windows 无线显示器与安卓手机系统「投屏」共用的协议（**部分电视需要 root**，见[已知问题](#-已知问题)）
   - 完整 RTSP 会话协商（M1–M7）
   - MPEG-2 TS 解复用 + H.264 硬解码，直送 MediaCodec 低延迟渲染
@@ -107,6 +109,28 @@
 - 或使用 Emby、Plex 等媒体服务器
 - 或按 `Win+K` 连接无线显示器（Miracast，部分电视需 root）
 
+### 电视命名（Issue #33）
+
+在应用主界面点击当前显示的设备名称，直接输入新名称；输入框支持下拉选择客厅、卧室、主卧、客卧、餐厅、书房等名称，也可输入自定义名称或恢复系统名称。选择「手机扫码命名」后，用同一局域网的手机扫码并在浏览器中保存；无需安装手机 App。二维码十分钟内有效，关闭窗口或离开应用后立即失效。
+
+名称保存在本机，重启后保留；保存后刷新 AirPlay、DLNA 和 Google Cast 服务发现，重新打开手机投屏清单查看。中文名称最长约 16 字（48 个 UTF-8 字节）。通过 root 开启 WFD 的设备会同步 Wi-Fi Direct / Windows Win+K 名称，启动服务时也会重新应用。Wi-Fi Direct 最多 32 个 UTF-8 字节，超长名称会按完整字符截短；其他设备仍受系统权限限制。
+
+以下截图来自 Sony 电视（192.168.2.116），示例名称为「客厅电视」。
+
+1. 在主界面选中当前显示的电视名称，按遥控器确认键或直接点击。
+
+   ![在主界面点击当前电视名称](docs/images/tv-name-home.png)
+
+2. 弹出名称输入框和备选清单，选择客厅、卧室、主卧等名称；需要自定义时收起清单，在输入框中编辑。
+
+   ![选择预设房间名称](docs/images/tv-name-presets.png)
+
+3. 确认输入框中的名称后点击「保存」，再重新打开手机投屏列表查看。也可点击「手机扫码命名」，通过同一局域网手机的浏览器修改并保存。
+
+   ![编辑电视名称并保存，或选择手机扫码命名](docs/images/tv-name-edit.png)
+
+> 非 root 通过系统 Wi-Fi Direct 开启的 Miracast，列表名称仍可能是系统名称，应用内改名不保证同步；详见下方已知问题。
+
 ### 🛠️ 从源码构建
 
 #### 环境要求
@@ -139,6 +163,7 @@ cd MiracastReceiver
 
 ### 📖 文档
 
+- [华为 Cast+ 实验性接收](MiracastReceiver/HUAWEI-CASTPLUS.md) - 启用方式、实现范围和验证清单
 - [ADB 故障日志采集教程](ADB故障日志采集教程.md) - 故障复现、电视 / 盒子日志采集与 Issue 反馈要求
 - [开发与调试指南](开发与调试指南.md) - 完整的开发、打包、安装和调试说明
 - [Windows 无线投屏 Root 配置说明](Windows无线投屏Root配置说明.md) - Miracast 启用步骤、协议实现要点与排错
@@ -173,18 +198,24 @@ cd MiracastReceiver
 2. **Emby 投屏兼容性**
    - 部分 Emby 客户端的 SOAP 请求格式可能需要特殊处理
 
-3. **Miracast 列表里显示的是 `Android_xxxx`，而不是电视名称**
-   - 安卓手机投屏和 Windows `Win+K` 列表里显示的是电视的 Wi-Fi Direct 设备名，由系统管理
+3. **非 root 开启 Wi-Fi Direct 投屏时，Miracast 名称可能显示不正确**
+   - 非 root 设备使用系统 Wi-Fi Direct / 屏幕镜像功能开启投屏时，安卓手机和 Windows `Win+K` 列表可能仍显示 `Android_xxxx` 或系统型号，与应用内设置的电视名称不一致
+   - 列表中的名称是系统管理的 Wi-Fi Direct 设备名；应用内直接改名或扫码保存名称，无法保证同步修改非 root 设备的该名称
    - Android 11 起修改该名称需要 `NETWORK_SETTINGS` 等系统级权限，普通应用无法修改，
      只能保持系统默认的 `Android_xxxx`
-   - 如果电视的「设置 → 网络」里有 Wi-Fi Direct 设置页，可以在那里改名；没有的话目前无法修改
-   - AirPlay / DLNA 不受影响，显示的是电视「设置 → 关于 → 设备名称」里的名字
+   - 如果电视的「设置 → 网络」里有 Wi-Fi Direct 设置页，可以在那里改名；没有该设置页时，通过 root 开启 WFD 的设备会由本应用同步名称
+   - AirPlay / DLNA / Google Cast 使用应用内「电视名称」；未设置时使用电视系统设备名称
 
 4. **需要「显示在其他应用上层」权限**
    - Android 10 起系统禁止后台弹出界面。未打开本应用时（开机自启后、或退回桌面后）投屏，
      播放页会被系统拦截，表现为投屏没有反应
    - 首次打开应用时会弹窗引导到系统设置页开启；如果电视没有该设置页，可用 adb 开启：
      `adb shell appops set com.weekd.miracastreceiver SYSTEM_ALERT_WINDOW allow`
+
+5. **Android Miracast 屏幕旋转后的分辨率声明尚未解决**
+   - 已支持接收端旋转、角度保存和黑边内容适配，但部分 Android 发送端仍选择横屏 1920×1080 视频帧，将竖屏内容缩小后加黑边发送
+   - 当前自定义分辨率扩展仅对支持该扩展的发送端生效；旋转、重连后仍不能保证按接收设备实际分辨率交换宽高
+   - 放大显示无法恢复源端已经损失的细节，旋转后的清晰度仍可能偏低。详见 [Miracast 旋转说明](MiracastReceiver/MIRACAST-ROTATION.md)
 
 ### 🗺️ 后续计划
 
@@ -223,6 +254,8 @@ cd MiracastReceiver
   - Emby, Plex media servers
 
 - **Experimental Google Cast media receiver**: HTTP/HTTPS audio/video through ExoPlayer with playback controls and status feedback. Implements the Default Media Receiver; Google device-certificate validation, YouTube-specific protocols and screen mirroring are unsupported. See [scope and testing](MiracastReceiver/GOOGLE-CAST.md).
+
+- **Huawei Cast+ support (experimental)**: Enable it in settings to receive wireless mirroring from compatible Huawei phones, with connection approval, PIN codes and rotation. Discovery and mirroring have been verified on a Sony Android 12 TV; other devices need testing. See [setup and scope](MiracastReceiver/HUAWEI-CASTPLUS.md).
 
 - **🖥️ Miracast/WFD**: The protocol behind both Windows Wireless Display and Android's built-in screen casting (**root required on some TVs**, see [Known Issues](#-known-issues))
   - Full RTSP session negotiation (M1–M7)
@@ -289,6 +322,14 @@ cd MiracastReceiver
 - Or cast from Emby, Plex media servers
 - Or press `Win+K` to connect a wireless display (Miracast, root required on some TVs)
 
+### TV names (Issue #33)
+
+Click the displayed device name on the main screen to edit it directly. The input offers room presets and the system name in its dropdown, and a button opens a QR code for a phone on the same LAN. Open the scanned link in a browser and save; no phone app is required. The QR link expires after ten minutes or when the dialog closes or the app leaves the foreground.
+
+Names persist across restarts and refresh AirPlay, DLNA and Google Cast discovery without restarting playback. Reopen the sender’s device list after saving. Custom names allow up to 48 UTF-8 bytes. Devices enabling WFD through root also synchronize the Wi-Fi Direct / Windows Win+K name, including at service startup. Wi-Fi Direct names are shortened at complete character boundaries to 32 UTF-8 bytes; other devices remain subject to system permissions.
+
+Screenshots from the Sony TV at 192.168.2.116 (Chinese UI): select the current name on the [home screen](docs/images/tv-name-home.png), choose a [room preset](docs/images/tv-name-presets.png) or type a custom name, then [save](docs/images/tv-name-edit.png). The same dialog offers QR naming from a phone browser on the same LAN. Non-root system Wi-Fi Direct names may remain unchanged; see Known Issues below.
+
 ### 🛠️ Build from Source
 
 #### Requirements
@@ -354,18 +395,24 @@ Output APKs: `app/build/outputs/apk/`
 2. **Emby Casting Compatibility**
    - Some Emby clients may require special SOAP format handling
 
-3. **Miracast lists the TV as `Android_xxxx` instead of its name**
-   - Android screen casting and Windows `Win+K` show the TV's Wi-Fi Direct device name, which the system owns
+3. **Incorrect Miracast name with non-root Wi-Fi Direct casting**
+   - On non-root devices using system Wi-Fi Direct / screen mirroring, Android casting and Windows `Win+K` may show `Android_xxxx` or the system model instead of the TV name configured in the app
+   - This Wi-Fi Direct name is system-managed; renaming in the app or via the QR page cannot guarantee it will be synchronized on non-root devices
    - Since Android 11, renaming it requires system permissions such as `NETWORK_SETTINGS`, so the app
      cannot change it and the system default `Android_xxxx` remains
-   - If the TV has a Wi-Fi Direct page under Settings → Network, rename it there; otherwise it cannot be changed for now
-   - AirPlay / DLNA are unaffected and use the name from the TV's Settings → About → Device name
+   - If the TV has a Wi-Fi Direct page under Settings → Network, rename it there; otherwise devices enabling WFD through root synchronize the name through this app
+   - AirPlay / DLNA / Google Cast use the app’s TV name, falling back to the TV system device name
 
 4. **"Display over other apps" permission required**
    - Since Android 10, apps may not open screens from the background. When the app is not open
      (after auto-start on boot, or after returning to the home screen), the player is blocked and casting appears to do nothing
    - The app prompts for it on first launch and opens the system settings page; if the TV has no such page, grant it via adb:
      `adb shell appops set com.weekd.miracastreceiver SYSTEM_ALERT_WINDOW allow`
+
+5. **Unresolved: resolution declaration after rotating Android Miracast**
+   - Receiver rotation, saved angles and black-bar fitting are supported, but some Android senders still transmit portrait content inside a landscape 1920×1080 frame
+   - Custom resolution extensions work only with compatible senders; rotating and reconnecting do not guarantee a stream matching the receiver’s actual dimensions with width and height exchanged
+   - Enlarging the content cannot recover detail already lost at the sender, so rotated mirroring can remain blurry. See [rotation details](MiracastReceiver/MIRACAST-ROTATION.md)
 
 ### 🗺️ Roadmap
 

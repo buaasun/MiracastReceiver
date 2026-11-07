@@ -24,6 +24,7 @@ import com.weekd.miracastreceiver.cast.CastPlayerBridge
 import com.weekd.miracastreceiver.cast.GoogleCastReceiver
 import com.weekd.miracastreceiver.airplay.AirPlayCapabilities
 import com.weekd.miracastreceiver.airplay.fitMirrorResolution
+import com.weekd.miracastreceiver.airplay.orientMirrorResolution
 import com.weekd.miracastreceiver.airplay.AirPlayReceiver
 import com.weekd.miracastreceiver.discovery.DeviceInfoProvider
 import com.weekd.miracastreceiver.dlna.DlnaMediaRenderer
@@ -33,6 +34,8 @@ import com.weekd.miracastreceiver.miracast.WfdRootHelper
 import com.weekd.miracastreceiver.miracast.WfdServer
 import com.weekd.miracastreceiver.miracast.WifiDirectManager
 import com.weekd.miracastreceiver.util.AppLanguage
+import com.weekd.miracastreceiver.util.AppSettings
+import android.content.SharedPreferences
 import com.weekd.miracastreceiver.utils.NetworkUtils
 import timber.log.Timber
 import java.util.UUID
@@ -64,6 +67,7 @@ class CastReceiverService : Service() {
     private lateinit var dlnaRenderer: DlnaMediaRenderer
     private lateinit var castPlayerBridge: CastPlayerBridge
     private lateinit var googleCastReceiver: GoogleCastReceiver
+    private lateinit var castPlusReceiver: com.weekd.miracastreceiver.castplus.CastPlusReceiver
     private lateinit var ssdpServer: SsdpServer
     private lateinit var upnpHttpServer: UpnpHttpServer
     private lateinit var wfdServer: WfdServer
@@ -78,11 +82,30 @@ class CastReceiverService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var networkWaitRunnable: Runnable? = null
     private var networkWaitElapsedMs = 0L
-    private var stopping = false
+    @Volatile private var stopping = false
+    private var rootAdvertisingActive = false
     private var rootAdvertisingPending = false
     private var rootAdvertisingAttempted = false
     private var p2pFailure: ReceiverStatus.Miracast? = null
     private var p2pGroupReady = false
+    private var airPlayLandscapeResolution = 1920 to 1080
+    private val nameListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == AppSettings.KEY_RECEIVER_NAME && initialized && !stopping) {
+            val name = DeviceInfoProvider(this).getDeviceName()
+            airPlayReceiver.updateDisplayName(name)
+            upnpHttpServer.updateDisplayName(name)
+            ssdpServer.refreshAdvertisement()
+            googleCastReceiver.updateDisplayName(name)
+            castPlusReceiver.updateDisplayName(name)
+            wifiDirectManager.updateDeviceName(name)
+            syncRootDeviceName()
+        }
+        if (key == AppSettings.KEY_AIRPLAY_PORTRAIT_DISPLAY && initialized && !stopping) {
+            val (width, height) = orientMirrorResolution(airPlayLandscapeResolution.first,
+                airPlayLandscapeResolution.second, AppSettings.isAirPlayPortraitDisplay(this))
+            airPlayReceiver.updateDisplayResolution(width, height)
+        }
+    }
 
     private val playerStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -124,6 +147,7 @@ class CastReceiverService : Service() {
         ReceiverStatus.service = ReceiverStatus.Service.STARTING
         ReceiverStatus.miracast = ReceiverStatus.Miracast.CHECKING
         super.onCreate()
+        AppSettings.observe(this, nameListener)
         Timber.i("CastReceiverService created")
         createNotificationChannel()
         // startForeground 放在 onStartCommand 里：前台服务类型要看这次是不是开机拉起的
@@ -144,11 +168,13 @@ class CastReceiverService : Service() {
         // A 4K display alone is insufficient: macOS may choose HEVC even when the
         // receiver has only advertised AVC. Keep AVC-only hardware within 1080p.
         val displayResolution = getBestDisplayResolution()
-        val mirrorResolution = if (AirPlayCapabilities.hardwareHevc4k) {
+        airPlayLandscapeResolution = if (AirPlayCapabilities.hardwareHevc4k) {
             displayResolution
         } else {
             fitMirrorResolution(displayResolution.first, displayResolution.second, 1920, 1080)
         }
+        val mirrorResolution = orientMirrorResolution(airPlayLandscapeResolution.first,
+            airPlayLandscapeResolution.second, AppSettings.isAirPlayPortraitDisplay(this))
         val deviceName = DeviceInfoProvider(this).getDeviceName()
         Timber.i("AirPlay mirror advertised resolution: ${mirrorResolution.first}x${mirrorResolution.second}")
 
@@ -191,6 +217,13 @@ class CastReceiverService : Service() {
         initDlnaServices()
         castPlayerBridge = CastPlayerBridge(this)
         googleCastReceiver = GoogleCastReceiver(this, deviceName, deviceUuid, castPlayerBridge.session)
+        castPlusReceiver = com.weekd.miracastreceiver.castplus.CastPlusReceiver(this) {
+            sendBroadcast(Intent(com.weekd.miracastreceiver.ui.PlayerActivity.ACTION_REPLACED).setPackage(packageName))
+            airPlayPlayerStarted = false
+            runCatching { airPlayReceiver.disconnectSender() }
+            runCatching { wfdServer.disconnectSender() }
+            dlnaRenderer.setStopped()
+        }
         val playerStateFilter = IntentFilter().apply {
             addAction(CastPlayerBridge.ACTION_STATE)
             addAction("com.weekd.miracastreceiver.DISCONNECT_SENDER")
@@ -452,6 +485,7 @@ class CastReceiverService : Service() {
         if (servicesStarted) {
             Timber.i("Cast services already running — only retrying Wi-Fi Direct")
             runCatching { wifiDirectManager.start() }
+            updateCastPlus()
             return
         }
 
@@ -502,11 +536,17 @@ class CastReceiverService : Service() {
         }, 30_000L)
         wfdServer.start()
         ReceiverStatus.service = ReceiverStatus.Service.RUNNING
+        updateCastPlus()
 
         Timber.i("All cast services started (AirPlay + DLNA + Miracast/WFD + experimental Google Cast)")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun updateCastPlus() {
+        if (com.weekd.miracastreceiver.util.AppSettings.isCastPlusEnabled(this)) castPlusReceiver.start()
+        else castPlusReceiver.stop()
+    }
 
     private fun advertiseMiracast() {
         if (stopping) return
@@ -534,6 +574,8 @@ class CastReceiverService : Service() {
             mainHandler.post {
                 rootAdvertisingPending = false
                 if (!stopping) {
+                    rootAdvertisingActive = result == WfdRootHelper.AdvertiseResult.COMMAND_SENT
+                    syncRootDeviceName()
                     ReceiverStatus.miracast = p2pFailure ?: when {
                         wifiDirectManager.isWfdConfigured -> ReceiverStatus.Miracast.ADVERTISING
                         result == WfdRootHelper.AdvertiseResult.COMMAND_SENT -> ReceiverStatus.Miracast.ADVERTISING
@@ -541,6 +583,19 @@ class CastReceiverService : Service() {
                         else -> ReceiverStatus.Miracast.SETUP_FAILED
                     }
                     Timber.i("Miracast startup: %s (%s)", ReceiverStatus.miracast, result)
+                }
+            }
+        }
+    }
+
+    private fun syncRootDeviceName() {
+        if (!rootAdvertisingActive || stopping) return
+        val appContext = applicationContext
+        wfdRootExecutor.execute {
+            if (!stopping) {
+                val name = DeviceInfoProvider(appContext).getDeviceName()
+                if (!WfdRootHelper.setDeviceName(appContext, name)) {
+                    Timber.w("WFD: could not sync P2P device name via root")
                 }
             }
         }
@@ -556,6 +611,7 @@ class CastReceiverService : Service() {
 
     override fun onDestroy() {
         stopping = true
+        AppSettings.unobserve(this, nameListener)
         ReceiverStatus.service = ReceiverStatus.Service.STOPPED
         super.onDestroy()
         Timber.i("CastReceiverService destroyed")
@@ -580,6 +636,7 @@ class CastReceiverService : Service() {
         ssdpServer.stop()
         upnpHttpServer.stop()
         googleCastReceiver.stop()
+        castPlusReceiver.stop()
         castPlayerBridge.stop()
 
         shutdownMiracast()
@@ -593,6 +650,7 @@ class CastReceiverService : Service() {
      */
     private fun shutdownMiracast() {
         stopping = true
+        rootAdvertisingActive = false
         runCatching { wfdServer.stop() }
         if (rootAdvertisingAttempted) {
             rootAdvertisingAttempted = false
