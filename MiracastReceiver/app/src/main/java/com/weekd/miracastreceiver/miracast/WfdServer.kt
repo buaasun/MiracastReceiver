@@ -1,6 +1,7 @@
 package com.weekd.miracastreceiver.miracast
 
 import android.content.Context
+import com.weekd.miracastreceiver.BuildConfig
 import kotlinx.coroutines.*
 import timber.log.Timber
 import java.net.InetSocketAddress
@@ -51,6 +52,9 @@ class WfdServer(
         private const val SCAN_CHUNK = 32          // 每批并发探测的地址数
     }
 
+    private fun isScanPaused(): Boolean =
+        isDiagnosticWfdScanPaused(BuildConfig.DEBUG, context.packageName) { context.filesDir }
+
     fun start() {
         if (isRunning) {
             Timber.w("WFD session starter already running")
@@ -62,13 +66,13 @@ class WfdServer(
         scope.launch {
             while (isRunning) {
                 try {
-                    if (android.os.SystemClock.elapsedRealtime() < reconnectAfterMs) {
+                    if (isScanPaused() || android.os.SystemClock.elapsedRealtime() < reconnectAfterMs) {
                         delay(SCAN_INTERVAL_MS)
                         continue
                     }
                     val socket = dialSource()
                     if (socket != null) {
-                        runSession(socket)
+                        if (isScanPaused()) runCatching { socket.close() } else runSession(socket)
                     }
                 } catch (e: Exception) {
                     if (isRunning) Timber.e(e, "WFD session loop error")
@@ -90,11 +94,16 @@ class WfdServer(
         val prefix = p2pSubnetPrefix() ?: return@coroutineScope null
 
         for (chunkStart in 2..254 step SCAN_CHUNK) {
-            if (!isRunning) return@coroutineScope null
+            if (!isRunning || isScanPaused()) return@coroutineScope null
             val range = chunkStart until minOf(chunkStart + SCAN_CHUNK, 255)
             val connected = range.map { host ->
                 async { tryConnect("$prefix$host") }
             }.awaitAll().filterNotNull()
+
+            if (isScanPaused()) {
+                connected.forEach { runCatching { it.close() } }
+                return@coroutineScope null
+            }
 
             if (connected.isNotEmpty()) {
                 val session = connected.first()
