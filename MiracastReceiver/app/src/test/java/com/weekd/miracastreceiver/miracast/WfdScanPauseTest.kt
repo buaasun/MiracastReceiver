@@ -32,6 +32,10 @@ class WfdScanPauseTest {
         assertFalse(isDiagnosticWfdScanPaused(true, "$testPackage.other") { directory })
     }
 
+    @Test fun debugTestPackagePausesWhenFilesDirectoryIsUnavailable() {
+        assertTrue(isDiagnosticWfdScanPaused(true, testPackage) { throw SecurityException("unavailable") })
+    }
+
     @Test fun nonTestTargetsNeverInspectFilesDirectory() {
         assertFalse(isDiagnosticWfdScanPaused(false, testPackage) { error("unexpected access") })
         assertFalse(isDiagnosticWfdScanPaused(true, "other.package") { error("unexpected access") })
