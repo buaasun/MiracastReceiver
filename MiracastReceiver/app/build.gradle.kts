@@ -41,6 +41,10 @@ android {
     }
 
     buildTypes {
+        debug {
+            applicationIdSuffix = ".miracasttest"
+            versionNameSuffix = "-miracasttest"
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(
