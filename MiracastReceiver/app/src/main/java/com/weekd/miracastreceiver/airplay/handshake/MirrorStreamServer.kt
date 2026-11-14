@@ -147,6 +147,8 @@ class MirrorStreamServer(
                 if (!readFully(input, header, 128)) break
                 val payloadSize = leInt(header, 0)
                 val payloadType = leShort(header, 4) and 0xFF
+                // type=2 的空控制包不含视频数据，不应断流或推进 AES-CTR 状态。
+                if (payloadSize == 0 && payloadType == 2) continue
                 if (payloadSize <= 0 || payloadSize > MAX_PAYLOAD) {
                     Logger.w("Mirror: bad payloadSize=$payloadSize type=$payloadType — stopping")
                     break

@@ -41,7 +41,7 @@ class MirrorStreamServerTest {
 
     @Test fun controlTypeUsesOnlyTheLowByteOfTheHeader() {
         val encrypted = MirrorCrypto.streamCipher(aesKey, sharedSecret, connectionId).update(avccFrame)
-        val frames = receive(packet(0x1002) + packet(0, encrypted))
+        val frames = receive(packet(0x1002) + packet(0x1000, encrypted))
 
         assertEquals(1, frames.size)
         assertArrayEquals(annexBFrame, frames.single())
@@ -56,8 +56,8 @@ class MirrorStreamServerTest {
 
     @Test fun invalidPayloadLengthsStillStopTheStream() {
         for (length in listOf(-1, 8 * 1024 * 1024 + 1)) {
-            val encrypted = MirrorCrypto.streamCipher(aesKey, sharedSecret, connectionId).update(avccFrame)
-            assertEquals(emptyList<ByteArray>(), receive(header(2, length) + packet(0, encrypted)))
+            // 不发送 EOF：必须因长度非法退出，不能仅因载荷不完整而通过。
+            assertEquals(emptyList<ByteArray>(), receive(header(2, length), closeInput = false))
         }
     }
 
@@ -73,7 +73,7 @@ class MirrorStreamServerTest {
             .putInt(length).putShort(type.toShort()).array()
 
     // 使用真实 TCP 读取与加密数据，只绕过 Android 解码线程，以检查协议边界和帧内容。
-    private fun receive(bytes: ByteArray): List<ByteArray> {
+    private fun receive(bytes: ByteArray, closeInput: Boolean = true): List<ByteArray> {
         val server = MirrorStreamServer(aesKey, sharedSecret, connectionId, { null })
         val running = field("running").apply { setBoolean(server, true) }
         val serverSocket = field("serverSocket").get(server) as ServerSocket
@@ -94,7 +94,7 @@ class MirrorStreamServerTest {
         try {
             Socket("127.0.0.1", serverSocket.localPort).use { socket ->
                 socket.getOutputStream().write(bytes)
-                socket.shutdownOutput()
+                if (closeInput) socket.shutdownOutput()
                 thread.join(2000)
                 assertFalse("镜像读取线程未在输入结束后退出", thread.isAlive)
                 assertNull(failure.get())
