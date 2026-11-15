@@ -1,0 +1,44 @@
+name: Read-only UI window probe
+
+on:
+  push:
+    branches: ['fix/uia-window-probe-*']
+    paths: ['tools/uia-probe/**', '.github/workflows/uia-probe.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Compile and test host-compatible probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/classes out/artifact
+          mapfile -t sources < <(find tools/uia-probe -name '*.java' -print)
+          javac --release 8 -encoding UTF-8 -d out/classes "${sources[@]}"
+          java -cp out/classes ProbeJsonTest
+      - name: Build standalone Android 9 dex jar
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'build-tools;35.0.0' >/dev/null
+          jar cf out/probe-classes.jar -C out/classes UiWindowProbe.class
+          "$ANDROID_HOME/build-tools/35.0.0/d8" --min-api 28 --output out/artifact/uia-window-probe.jar out/probe-classes.jar
+          printf '%s\n' "$GITHUB_SHA" > out/artifact/commit.txt
+          (cd out/artifact && sha256sum uia-window-probe.jar > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uia-window-probe
+          path: out/artifact/
+          retention-days: 3
+          if-no-files-found: error
