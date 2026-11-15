@@ -1,5 +1,10 @@
 # Native PBC diagnostic (test package only)
 
+上游同步版本使用 `top.jast.miracastreceiver`，源码与测试已迁移到新 namespace。
+下面的旧隔离包白名单刻意保持不变，因此当前标准包即使是 debug、存在 marker，
+也不会启用 Native PBC 或 scan-pause 诊断。不要把白名单直接改成正式包名；
+如需重新提供隔离诊断包，应单独评审包名、授权与诊断开关，并更新对应测试。
+
 This experimental helper is off by default. It runs only in a debug build whose
 application ID is exactly `com.weekd.miracastreceiver.miracasttest`, after the
 private file `files/wfd-auto-pbc.enable` has been created for that package.

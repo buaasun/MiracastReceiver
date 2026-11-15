@@ -7,9 +7,19 @@ on:
       - '**/*.md'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
+    name: ARM32 (${{ matrix.backend }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [uxplay, kotlin]
+    env:
+      AIRPLAY_BACKEND: ${{ matrix.backend }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,26 +44,91 @@ jobs:
         working-directory: MiracastReceiver
         run: |
           chmod +x gradlew
-          ./gradlew testDebugUnitTest assembleDebug assembleRelease -PbuildArm32 --no-daemon --stacktrace
+          args=(-PbuildArm32)
+          if [[ "$AIRPLAY_BACKEND" == "uxplay" ]]; then
+            args+=(-PuseUxPlay)
+          fi
+          ./gradlew testDebugUnitTest assembleDebug assembleRelease "${args[@]}" --no-daemon --stacktrace
+
+      - name: Verify APK identity and backend libraries
+        working-directory: MiracastReceiver
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          backend = os.environ['AIRPLAY_BACKEND']
+          native = backend == 'uxplay'
+          aapt = Path(os.environ['ANDROID_HOME']) / 'build-tools/35.0.0/aapt'
+          apks = sorted(Path('app/build/outputs/apk').glob('*/*.apk'))
+          assert len(apks) == 2, f'Expected debug and release APKs, got {apks}'
+          records = []
+          for apk in apks:
+              badging = subprocess.check_output([str(aapt), 'dump', 'badging', str(apk)], text=True)
+              assert "package: name='top.jast.miracastreceiver'" in badging, badging
+              assert f"sdkVersion:'{23 if native else 21}'" in badging, badging
+              with zipfile.ZipFile(apk) as archive:
+                  libraries = {name for name in archive.namelist() if name.startswith('lib/') and name.endswith('.so')}
+                  assert libraries and all(name.startswith('lib/armeabi-v7a/') for name in libraries)
+                  expected = {'libairplay_native.so', 'libcrypto.so', 'liboboe.so', 'libc++_shared.so'}
+                  for name in expected:
+                      entry = f'lib/armeabi-v7a/{name}'
+                      if native:
+                          assert entry in libraries, f'{apk}: missing {name}'
+                      elif name == 'libairplay_native.so':
+                          assert entry not in libraries, f'{apk}: UxPlay included in Kotlin build'
+                  for name in libraries:
+                      elf = archive.read(name)
+                      assert elf[:5] == b'\x7fELF\x01' and int.from_bytes(elf[18:20], 'little') == 40, name
+              records.append({'file': apk.name, 'sha256': hashlib.sha256(apk.read_bytes()).hexdigest()})
+          output = Path('app/build/ci-provenance')
+          output.mkdir(parents=True, exist_ok=True)
+          metadata = {
+              'commit': os.environ['GITHUB_SHA'],
+              'backend': backend,
+              'applicationId': 'top.jast.miracastreceiver',
+              'abi': 'armeabi-v7a',
+              'apks': records,
+              'nativeSource': 'https://github.com/weekdayjast/MiracastReceiver/releases/download/v1.2.15/uxplay-native-source-v1.2.15.tar.gz' if native else None,
+          }
+          (output / 'build-info.json').write_text(json.dumps(metadata, indent=2) + '\n')
+          print(json.dumps(metadata, indent=2))
+          PY
+          git archive --format=tar.gz -o app/build/ci-provenance/application-source.tar.gz HEAD
 
       - name: Upload unit test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: miracast-unit-test-results
+          name: miracast-unit-test-results-${{ matrix.backend }}
           path: MiracastReceiver/app/build/test-results/testDebugUnitTest/*.xml
           if-no-files-found: ignore
 
       - name: Upload ARM32 APK
         uses: actions/upload-artifact@v4
         with:
-          name: miracast-debug-arm32
+          name: miracast-debug-arm32-${{ matrix.backend }}
           path: MiracastReceiver/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
 
       - name: Upload ARM32 Release APK
         uses: actions/upload-artifact@v4
         with:
-          name: miracast-release-arm32
+          name: miracast-release-arm32-${{ matrix.backend }}
           path: MiracastReceiver/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Upload source and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: miracast-source-and-provenance-${{ matrix.backend }}
+          path: |
+            MiracastReceiver/app/build/ci-provenance/*
+            MiracastReceiver/app/src/uxplay/NOTICE.md
+            MiracastReceiver/app/src/uxplay/BUILDING.md
+            MiracastReceiver/app/src/uxplay/LICENSE.android-airplay-server
           if-no-files-found: error
