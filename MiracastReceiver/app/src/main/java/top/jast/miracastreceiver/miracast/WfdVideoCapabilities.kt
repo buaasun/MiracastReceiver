@@ -86,8 +86,14 @@ internal fun wfdVideoCapabilityLines(
 /** M4 必须单选已声明的 CEA 1080p30，不能夹带其他分辨率族或多个模式。 */
 internal fun matchesWfdCompatibilityMode(value: String): Boolean {
     val fields = value.trim().split(Regex("\\s+"))
-    return fields.size == 13 && fields[4].toLongOrNull(16) == 0x80L &&
-        fields[5].toLongOrNull(16) == 0L && fields[6].toLongOrNull(16) == 0L
+    if (fields.size != 13) return false
+    val widths = listOf(2, 2, 2, 2, 8, 8, 8, 2, 4, 4, 2)
+    if (!fields.take(11).zip(widths).all { (field, width) ->
+            field.matches(Regex("[0-9a-fA-F]{$width}"))
+        }) return false
+    return fields[2].toInt(16) == 0x02 && fields[3].toInt(16) == 0x10 &&
+        fields[4].toLong(16) == 0x80L && fields[5].toLong(16) == 0L && fields[6].toLong(16) == 0L &&
+        fields[11].equals("none", ignoreCase = true) && fields[12].equals("none", ignoreCase = true)
 }
 
 internal fun matchesWfdCustomMode(value: String, mode: WfdCustomVideoMode): Boolean {
