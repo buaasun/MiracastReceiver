@@ -88,7 +88,7 @@ class WfdVideoCapabilitiesTest {
     @Test fun actualM3ResponseAdvertisesCustomPortraitModeAndCorrectByteLength() {
         val request = "wfd_video_formats\r\nwfdx_video_formats\r\nmicrosoft_custom_video_formats\r\n"
         val socket = WireSocket(getParameters(request))
-        WfdSessionHandler(ContextWrapper(null), socket, 19000) { extended ->
+        sessionHandler(socket) { extended ->
             assertTrue(extended)
             WfdCustomVideoMode(1080, 2160, 60, 0x20)
         }.handleSession()
@@ -102,7 +102,7 @@ class WfdVideoCapabilitiesTest {
 
     @Test fun legacyM3DoesNotEvenQueryCustomHardwareCapabilities() {
         val socket = WireSocket(getParameters("wfd_video_formats\r\nwfd_client_rtp_ports\r\n"))
-        WfdSessionHandler(ContextWrapper(null), socket, 19000) { error("Unexpected extension query") }.handleSession()
+        sessionHandler(socket) { error("Unexpected extension query") }.handleSession()
         val response = socket.replies.toString("UTF-8")
         assertTrue(response.contains("wfd_video_formats:"))
         assertFalse(response.contains("wfdx_video_formats:"))
@@ -112,7 +112,168 @@ class WfdVideoCapabilitiesTest {
     @Test fun m4RejectsAnUnadvertisedCustomResolution() {
         val body = "microsoft_custom_video_formats: 0438 0870 003C\r\n"
         val socket = WireSocket("SET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\nCSeq: 4\r\nContent-Length: ${body.length}\r\n\r\n$body")
-        WfdSessionHandler(ContextWrapper(null), socket, 19000).handleSession()
+        sessionHandler(socket).handleSession()
         assertTrue(socket.replies.toString("UTF-8").startsWith("RTSP/1.0 400 Bad Request"))
+    }
+
+    // Use the old constructor until the injectable compatibility provider exists, so RED
+    // exercises the current protocol instead of failing Kotlin compilation.
+    private fun sessionHandler(
+        socket: WireSocket,
+        compatibilityModeProvider: () -> Boolean = { false },
+        customModeProvider: (Boolean) -> WfdCustomVideoMode? = { null }
+    ): WfdSessionHandler {
+        val constructor = WfdSessionHandler::class.java.constructors.firstOrNull {
+            it.parameterTypes.toList() == listOf(
+                android.content.Context::class.java, Socket::class.java, Int::class.javaPrimitiveType,
+                kotlin.jvm.functions.Function0::class.java, kotlin.jvm.functions.Function1::class.java
+            )
+        }
+        return if (constructor != null) {
+            constructor.newInstance(ContextWrapper(null), socket, 19000,
+                compatibilityModeProvider, customModeProvider) as WfdSessionHandler
+        } else {
+            // Keep this trailing lambda source-compatible when the provider is added.
+            WfdSessionHandler(ContextWrapper(null), socket, 19000) { customModeProvider(it) }
+        }
+    }
+
+    private val allVideoParameters =
+        "wfd_video_formats\r\nwfdx_video_formats\r\nmicrosoft_custom_video_formats\r\n"
+    private val custom60 = WfdCustomVideoMode(2160, 1080, 60, 0x20)
+    private val legacy30 = "00 00 02 10 00000080 00000000 00000000 00 0000 0000 00 none none"
+    private val legacy60 = "00 00 02 10 00000100 00000000 00000000 00 0000 0000 00 none none"
+    private val extended60 = "0040 00 0002 0020 0000000100 0000000000 00000000 00 0000 0000 00 none none"
+
+    private fun setParameters(body: String, cseq: Int = 4): String =
+        "SET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\nCSeq: $cseq\r\nContent-Length: ${body.toByteArray(Charsets.UTF_8).size}\r\n\r\n$body"
+
+    private fun parameterValues(response: String, name: String): List<String> =
+        response.lineSequence().filter { it.startsWith("$name:") }
+            .map { it.substringAfter(':').trim() }.toList()
+
+    private fun assertOnly1080p30(response: String) {
+        val values = parameterValues(response, "wfd_video_formats")
+        assertFalse("Missing legacy video capability", values.isEmpty())
+        values.forEach { value ->
+            val fields = value.split(Regex("\\s+"))
+            assertEquals(0x80L, fields[4].toLong(16))
+            assertEquals(0L, fields[5].toLong(16))
+            assertEquals(0L, fields[6].toLong(16))
+        }
+    }
+
+    @Test fun compatibilityLegacyM3AdvertisesOnly1080p30() {
+        val socket = WireSocket(getParameters("wfd_video_formats\r\n"))
+        sessionHandler(socket, { true }) { error("Legacy query must not probe custom codecs") }.handleSession()
+        assertOnly1080p30(socket.replies.toString("UTF-8"))
+    }
+
+    @Test fun compatibilityExtensionsCannotAdvertiseCustom60OrLargerModes() {
+        val socket = WireSocket(getParameters(allVideoParameters))
+        var customQueries = 0
+        sessionHandler(socket, { true }) { customQueries++; custom60 }.handleSession()
+        val response = socket.replies.toString("UTF-8")
+        assertOnly1080p30(response)
+        for (name in listOf("wfdx_video_formats", "microsoft_custom_video_formats")) {
+            assertTrue("$name must be omitted or none", parameterValues(response, name).all { it == "none" })
+        }
+        assertEquals("Compatibility mode must bypass dynamic custom hardware selection", 0, customQueries)
+    }
+
+    @Test fun compatibilityOffPreservesLegacyAndCustomCapabilitiesExactly() {
+        val socket = WireSocket(getParameters(allVideoParameters))
+        var customQueries = 0
+        sessionHandler(socket, { false }) { extended ->
+            assertTrue(extended)
+            customQueries++
+            custom60
+        }.handleSession()
+        val response = socket.replies.toString("UTF-8")
+        assertEquals(listOf("00 00 02 10 000001C0 00000000 00000000 00 0000 0000 00 none none"),
+            parameterValues(response, "wfd_video_formats"))
+        assertEquals(listOf(custom60.extendedFormats()), parameterValues(response, "wfdx_video_formats"))
+        assertEquals(listOf(custom60.customFormat()), parameterValues(response, "microsoft_custom_video_formats"))
+        assertEquals(1, customQueries)
+    }
+
+    private fun assertCompatibilityRejects(selection: String) {
+        val socket = WireSocket(getParameters(allVideoParameters) +
+            setParameters("$selection\r\nwfd_presentation_URL: rtsp://localhost/wfd1.0/streamid=0 none\r\n") +
+            setParameters("wfd_trigger_method: SETUP\r\n", 5) +
+            "RTSP/1.0 200 OK\r\nCSeq: 1\r\nSession: unsupported\r\n\r\n")
+        var established = false
+        var started = false
+        val handler = sessionHandler(socket, { true }) { custom60 }
+        handler.onSessionEstablished = { established = true }
+        handler.onStreamStart = { started = true }
+        handler.handleSession()
+        val response = socket.replies.toString("UTF-8")
+        assertTrue("M4 must reject the unadvertised video mode", response.contains("RTSP/1.0 400 Bad Request\r\nCSeq: 4\r\n"))
+        assertFalse("Rejected M4 must not advance to SETUP", response.lineSequence().any { it.startsWith("SETUP ") })
+        assertFalse("Rejected M4 must not advance to PLAY", response.lineSequence().any { it.startsWith("PLAY ") })
+        assertFalse(established)
+        assertFalse(started)
+    }
+
+    @Test fun compatibilityM4RejectsLegacy1080p60AndDoesNotPlay() =
+        assertCompatibilityRejects("wfd_video_formats: $legacy60")
+
+    @Test fun compatibilityM4RejectsExtended1080p60AndDoesNotPlay() =
+        assertCompatibilityRejects("wfdx_video_formats: $extended60")
+
+    @Test fun compatibilityM4RejectsCustomModeEvenIfHardwareSupportsIt() =
+        assertCompatibilityRejects("microsoft_custom_video_formats: ${custom60.customFormat()}")
+
+    @Test fun compatibilityM4RejectsCustomEvenAlongsideValidLegacy30() =
+        assertCompatibilityRejects("wfd_video_formats: $legacy30\r\nmicrosoft_custom_video_formats: ${custom60.customFormat()}")
+
+    @Test fun compatibilityM4RejectsCombined30And60Bitmask() =
+        assertCompatibilityRejects("wfd_video_formats: ${legacy30.replace("00000080", "00000180")}")
+
+    @Test fun compatibilityM4Rejects720p30() =
+        assertCompatibilityRejects("wfd_video_formats: ${legacy30.replace("00000080", "00000020")}")
+
+    @Test fun compatibilityM4RejectsAdditionalVesaMode() =
+        assertCompatibilityRejects("wfd_video_formats: 00 00 02 10 00000080 00000001 00000000 00 0000 0000 00 none none")
+
+    @Test fun compatibilityM4AcceptsAdvertised1080p30AndAdvancesToPlay() {
+        val socket = WireSocket(getParameters(allVideoParameters) +
+            setParameters("wfd_video_formats: $legacy30\r\nmicrosoft_custom_video_formats: none\r\n" +
+                "wfd_presentation_URL: rtsp://localhost/wfd1.0/streamid=0 none\r\n") +
+            setParameters("wfd_trigger_method: SETUP\r\n", 5) +
+            "RTSP/1.0 200 OK\r\nCSeq: 1\r\nSession: compatible\r\n\r\n")
+        var established = false
+        val handler = sessionHandler(socket, { true }) { custom60 }
+        handler.onSessionEstablished = { established = true }
+        handler.handleSession()
+        val response = socket.replies.toString("UTF-8")
+        assertFalse(response.contains("400 Bad Request"))
+        assertTrue(response.lineSequence().any { it == "SETUP rtsp://localhost/wfd1.0/streamid=0 RTSP/1.0" })
+        assertTrue(response.lineSequence().any { it == "PLAY rtsp://localhost/wfd1.0/streamid=0 RTSP/1.0" })
+        assertTrue(established)
+    }
+
+    @Test fun compatibilityOffStillAcceptsPreviouslySupported60FpsCustomMode() {
+        val socket = WireSocket(getParameters(allVideoParameters) +
+            setParameters("wfdx_video_formats: $extended60\r\n" +
+                "microsoft_custom_video_formats: ${custom60.customFormat()}\r\nwfd_trigger_method: SETUP\r\n") +
+            "RTSP/1.0 200 OK\r\nCSeq: 1\r\nSession: original\r\n\r\n")
+        sessionHandler(socket, { false }) { custom60 }.handleSession()
+        val response = socket.replies.toString("UTF-8")
+        assertFalse(response.contains("400 Bad Request"))
+        assertTrue(response.lineSequence().any { it.startsWith("PLAY ") })
+    }
+
+    @Test fun compatibilitySettingIsReadOnceAcrossRepeatedM3AndM4() {
+        var reads = 0
+        val socket = WireSocket(getParameters(allVideoParameters) + getParameters(allVideoParameters) +
+            setParameters("wfd_video_formats: $legacy60\r\n"))
+        sessionHandler(socket, { ++reads == 1 }) { custom60 }.handleSession()
+        val response = socket.replies.toString("UTF-8")
+        assertEquals("Compatibility setting must be snapshotted for each session", 1, reads)
+        assertEquals(2, parameterValues(response, "wfd_video_formats").size)
+        assertOnly1080p30(response)
+        assertTrue(response.contains("RTSP/1.0 400 Bad Request\r\nCSeq: 4\r\n"))
     }
 }
