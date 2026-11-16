@@ -116,8 +116,7 @@ class WfdVideoCapabilitiesTest {
         assertTrue(socket.replies.toString("UTF-8").startsWith("RTSP/1.0 400 Bad Request"))
     }
 
-    // Use the old constructor until the injectable compatibility provider exists, so RED
-    // exercises the current protocol instead of failing Kotlin compilation.
+    // 注入接口尚未实现时回落到旧构造器，让 RED 验证现有协议行为而非编译失败。
     private fun sessionHandler(
         socket: WireSocket,
         compatibilityModeProvider: () -> Boolean = { false },
@@ -133,7 +132,7 @@ class WfdVideoCapabilitiesTest {
             constructor.newInstance(ContextWrapper(null), socket, 19000,
                 compatibilityModeProvider, customModeProvider) as WfdSessionHandler
         } else {
-            // Keep this trailing lambda source-compatible when the provider is added.
+            // 此调用同时确保新增 provider 后仍支持原来的 trailing lambda。
             WfdSessionHandler(ContextWrapper(null), socket, 19000) { customModeProvider(it) }
         }
     }
@@ -157,6 +156,7 @@ class WfdVideoCapabilitiesTest {
         assertFalse("Missing legacy video capability", values.isEmpty())
         values.forEach { value ->
             val fields = value.split(Regex("\\s+"))
+            assertEquals("38", fields[0])
             assertEquals(0x80L, fields[4].toLong(16))
             assertEquals(0L, fields[5].toLong(16))
             assertEquals(0L, fields[6].toLong(16))
@@ -237,6 +237,27 @@ class WfdVideoCapabilitiesTest {
     @Test fun compatibilityM4RejectsAdditionalVesaMode() =
         assertCompatibilityRejects("wfd_video_formats: 00 00 02 10 00000080 00000001 00000000 00 0000 0000 00 none none")
 
+    @Test fun compatibilityM4RejectsUnadvertisedExtensionsEvenAt30Fps() {
+        assertCompatibilityRejects("wfdx_video_formats: ${extended60.replace("0000000100", "0000000080")}")
+        assertCompatibilityRejects("microsoft_custom_video_formats: 0780 0438 001E")
+        assertCompatibilityRejects("wfd_video_formats: $legacy30\r\nwfdx_video_formats: $extended60")
+    }
+
+    @Test fun compatibilityM4RejectsMalformedOrAdditionalHandheldModes() {
+        assertCompatibilityRejects("wfd_video_formats: invalid")
+        assertCompatibilityRejects("wfd_video_formats: 00 00 02 10 00000080 00000000 00000001 00 0000 0000 00 none none")
+    }
+
+    @Test fun compatibilityCannotSetupOrPlayWithoutSelectingAnAdvertisedMode() {
+        val socket = WireSocket(getParameters(allVideoParameters) +
+            setParameters("wfd_trigger_method: SETUP\r\n") +
+            "RTSP/1.0 200 OK\r\nCSeq: 1\r\nSession: missing-mode\r\n\r\n")
+        sessionHandler(socket, { true }) { custom60 }.handleSession()
+        val response = socket.replies.toString("UTF-8")
+        assertTrue(response.contains("RTSP/1.0 400 Bad Request\r\nCSeq: 4\r\n"))
+        assertFalse(response.lineSequence().any { it.startsWith("SETUP ") || it.startsWith("PLAY ") })
+    }
+
     @Test fun compatibilityM4AcceptsAdvertised1080p30AndAdvancesToPlay() {
         val socket = WireSocket(getParameters(allVideoParameters) +
             setParameters("wfd_video_formats: $legacy30\r\nmicrosoft_custom_video_formats: none\r\n" +
@@ -261,6 +282,21 @@ class WfdVideoCapabilitiesTest {
             "RTSP/1.0 200 OK\r\nCSeq: 1\r\nSession: original\r\n\r\n")
         sessionHandler(socket, { false }) { custom60 }.handleSession()
         val response = socket.replies.toString("UTF-8")
+        assertFalse(response.contains("400 Bad Request"))
+        assertTrue(response.lineSequence().any { it.startsWith("PLAY ") })
+    }
+
+    @Test fun disabledCompatibilitySettingAlsoRemainsFixedForTheSession() {
+        var reads = 0
+        val socket = WireSocket(getParameters(allVideoParameters) + getParameters(allVideoParameters) +
+            setParameters("wfd_video_formats: $legacy60\r\nmicrosoft_custom_video_formats: ${custom60.customFormat()}\r\n" +
+                "wfd_trigger_method: SETUP\r\n") +
+            "RTSP/1.0 200 OK\r\nCSeq: 1\r\nSession: unchanged\r\n\r\n")
+        sessionHandler(socket, { ++reads != 1 }) { custom60 }.handleSession()
+        val response = socket.replies.toString("UTF-8")
+        assertEquals(1, reads)
+        assertEquals(listOf(custom60.customFormat(), custom60.customFormat()),
+            parameterValues(response, "microsoft_custom_video_formats"))
         assertFalse(response.contains("400 Bad Request"))
         assertTrue(response.lineSequence().any { it.startsWith("PLAY ") })
     }
