@@ -170,6 +170,8 @@
             android:textColor="@color/text_primary"
             android:textSize="16sp" />
 
+        <include layout="@layout/setting_miracast_compatibility" />
+
         <include layout="@layout/setting_castplus" />
 
         <LinearLayout

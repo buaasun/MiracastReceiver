@@ -66,8 +66,14 @@ internal fun wfdCustomVideoMode(context: Context, extended: Boolean): WfdCustomV
     }
 }
 
-/** Only negotiate extensions the peer explicitly requested; keep the legacy CEA fallback. */
-internal fun wfdVideoCapabilityLines(requested: Set<String>, mode: WfdCustomVideoMode?): List<String> {
+/** 仅提供对端请求的扩展；兼容模式只声明标准 CEA 1080p30。 */
+internal fun wfdVideoCapabilityLines(
+    requested: Set<String>, mode: WfdCustomVideoMode?, compatibilityMode: Boolean = false
+): List<String> {
+    if (compatibilityMode) return buildList {
+        add("wfd_video_formats: 38 00 02 10 00000080 00000000 00000000 00 0000 0000 00 none none")
+        if ("microsoft_custom_video_formats" in requested) add("microsoft_custom_video_formats: none")
+    }
     val lines = mutableListOf("wfd_video_formats: 00 00 02 10 000001C0 00000000 00000000 00 0000 0000 00 none none")
     if ("wfdx_video_formats" in requested && mode != null) lines += "wfdx_video_formats: ${mode.extendedFormats()}"
     if ("microsoft_custom_video_formats" in requested) {
@@ -75,6 +81,13 @@ internal fun wfdVideoCapabilityLines(requested: Set<String>, mode: WfdCustomVide
         lines += "microsoft_custom_video_formats: ${usable?.customFormat() ?: "none"}"
     }
     return lines
+}
+
+/** M4 必须单选已声明的 CEA 1080p30，不能夹带其他分辨率族或多个模式。 */
+internal fun matchesWfdCompatibilityMode(value: String): Boolean {
+    val fields = value.trim().split(Regex("\\s+"))
+    return fields.size == 13 && fields[4].toLongOrNull(16) == 0x80L &&
+        fields[5].toLongOrNull(16) == 0L && fields[6].toLongOrNull(16) == 0L
 }
 
 internal fun matchesWfdCustomMode(value: String, mode: WfdCustomVideoMode): Boolean {

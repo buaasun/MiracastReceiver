@@ -206,6 +206,12 @@ class MainActivity : AppCompatActivity() {
             isChecked = AppSettings.isAutoRotateToFit(this@MainActivity)
             setOnCheckedChangeListener { _, checked -> AppSettings.setAutoRotateToFit(this@MainActivity, checked) }
         }
+        findViewById<SwitchCompat>(R.id.switch_miracast_compatibility).apply {
+            isChecked = AppSettings.isMiracastCompatibilityMode(this@MainActivity)
+            setOnCheckedChangeListener { _, checked ->
+                AppSettings.setMiracastCompatibilityMode(this@MainActivity, checked)
+            }
+        }
         switchReturnToApp = findViewById(R.id.switch_return_to_app)
         tvLanguageValue = findViewById(R.id.tv_language_value)
 

@@ -12,6 +12,13 @@ object AppSettings {
     const val KEY_RECEIVER_NAME = "receiver_name"
     const val KEY_AIRPLAY_PORTRAIT_DISPLAY = "airplay_portrait_display"
 
+    fun isMiracastCompatibilityMode(context: Context): Boolean =
+        prefs(context).getBoolean("miracast_compatibility_mode", false)
+
+    fun setMiracastCompatibilityMode(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean("miracast_compatibility_mode", enabled).apply()
+    }
+
     fun getMiracastManualRotation(context: Context): Int = prefs(context).getInt("miracast_manual_rotation", 0)
     fun isMiracastPortraitDisplay(context: Context): Boolean = prefs(context).getBoolean("miracast_portrait_display", false)
 

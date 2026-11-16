@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="auto_rotate_to_fit">自动旋转适配屏幕</string>
+    <string name="miracast_compatibility_mode">Miracast 兼容模式（1080p30）</string>
+    <string name="miracast_compatibility_mode_hint">使用兼容视频渲染，将 Miracast 限制为每秒 30 帧。修改后请断开并重新投屏；其他投屏协议不受影响。</string>
     <!-- 首页 -->
     <string name="waiting_connection">等待投屏连接...</string>
     <string name="device_ip">设备 IP: %s</string>

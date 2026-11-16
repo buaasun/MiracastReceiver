@@ -11,6 +11,7 @@ val targetAbis = when {
 }
 val buildUniversalApk = targetAbis.size > 1
 val useUxPlay = providers.gradleProperty("useUxPlay").isPresent
+val compatibilityTestPackage = providers.gradleProperty("compatibilityTestPackage").isPresent
 if (useUxPlay) require(targetAbis.all { it in listOf("armeabi-v7a", "arm64-v8a") }) {
     "UxPlay libraries are available for ARM32 and ARM64 only"
 }
@@ -20,7 +21,8 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "top.jast.miracastreceiver"
+        applicationId = if (compatibilityTestPackage) "top.jast.miracastreceiver.compat" else "top.jast.miracastreceiver"
+        manifestPlaceholders["receiverLabel"] = if (compatibilityTestPackage) "Miracast 兼容测试" else "@string/app_name"
         minSdk = 21
         targetSdk = 36
         versionCode = 23

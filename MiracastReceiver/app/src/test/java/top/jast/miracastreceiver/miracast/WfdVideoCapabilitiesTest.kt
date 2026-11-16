@@ -216,6 +216,23 @@ class WfdVideoCapabilitiesTest {
         assertFalse(started)
     }
 
+    @Test fun compatibilityM4RejectsMalformedProfileAndLevel() =
+        assertCompatibilityRejects("wfd_video_formats: ${legacy30.replace("02 10", "ZZ ZZ")}")
+
+    @Test fun compatibilityM4RejectsUnadvertisedProfileOrLevel() {
+        for (profileAndLevel in listOf("04 10", "02 80")) {
+            assertCompatibilityRejects("wfd_video_formats: ${legacy30.replace("02 10", profileAndLevel)}")
+        }
+    }
+
+    @Test fun compatibilityM4RejectsMalformedOtherCodecFields() {
+        for (index in listOf(0, 1, 7, 8, 9, 10, 11, 12)) {
+            val fields = legacy30.split(' ').toMutableList()
+            fields[index] = "ZZ"
+            assertCompatibilityRejects("wfd_video_formats: ${fields.joinToString(" ")}")
+        }
+    }
+
     @Test fun compatibilityM4RejectsLegacy1080p60AndDoesNotPlay() =
         assertCompatibilityRejects("wfd_video_formats: $legacy60")
 

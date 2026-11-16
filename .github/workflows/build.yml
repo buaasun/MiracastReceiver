@@ -6,6 +6,12 @@ on:
     paths-ignore:
       - '**/*.md'
   workflow_dispatch:
+    inputs:
+      compatibility_test_package:
+        description: '使用独立兼容测试包名，保留电视原安装和数据'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -20,6 +26,7 @@ jobs:
         backend: [uxplay, kotlin]
     env:
       AIRPLAY_BACKEND: ${{ matrix.backend }}
+      COMPAT_TEST_PACKAGE: ${{ github.event.inputs.compatibility_test_package || 'false' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -48,6 +55,9 @@ jobs:
           if [[ "$AIRPLAY_BACKEND" == "uxplay" ]]; then
             args+=(-PuseUxPlay)
           fi
+          if [[ "$COMPAT_TEST_PACKAGE" == "true" ]]; then
+            args+=(-PcompatibilityTestPackage)
+          fi
           ./gradlew testDebugUnitTest assembleDebug assembleRelease "${args[@]}" --no-daemon --stacktrace
 
       - name: Verify APK identity and backend libraries
@@ -57,19 +67,23 @@ jobs:
           import hashlib
           import json
           import os
+          import re
           import subprocess
           import zipfile
           from pathlib import Path
 
           backend = os.environ['AIRPLAY_BACKEND']
           native = backend == 'uxplay'
-          aapt = Path(os.environ['ANDROID_HOME']) / 'build-tools/35.0.0/aapt'
+          test_package = os.environ.get('COMPAT_TEST_PACKAGE') == 'true'
+          application_id = 'top.jast.miracastreceiver' + ('.compat' if test_package else '')
+          build_tools = Path(os.environ['ANDROID_HOME']) / 'build-tools/35.0.0'
+          aapt = build_tools / 'aapt'
           apks = sorted(Path('app/build/outputs/apk').glob('*/*.apk'))
           assert len(apks) == 2, f'Expected debug and release APKs, got {apks}'
           records = []
           for apk in apks:
               badging = subprocess.check_output([str(aapt), 'dump', 'badging', str(apk)], text=True)
-              assert "package: name='top.jast.miracastreceiver'" in badging, badging
+              assert f"package: name='{application_id}'" in badging, badging
               assert f"sdkVersion:'{23 if native else 21}'" in badging, badging
               with zipfile.ZipFile(apk) as archive:
                   libraries = {name for name in archive.namelist() if name.startswith('lib/') and name.endswith('.so')}
@@ -84,13 +98,21 @@ jobs:
                   for name in libraries:
                       elf = archive.read(name)
                       assert elf[:5] == b'\x7fELF\x01' and int.from_bytes(elf[18:20], 'little') == 40, name
-              records.append({'file': apk.name, 'sha256': hashlib.sha256(apk.read_bytes()).hexdigest()})
+              certificate_sha256 = None
+              if apk.parent.name == 'debug':
+                  signature = subprocess.check_output([str(build_tools / 'apksigner'), 'verify', '--print-certs', str(apk)], text=True)
+                  match = re.search(r'Signer #1 certificate SHA-256 digest: ([0-9a-fA-F]+)', signature)
+                  assert match, signature
+                  certificate_sha256 = match.group(1).lower()
+              records.append({'file': apk.name, 'sha256': hashlib.sha256(apk.read_bytes()).hexdigest(),
+                              'signerCertificateSha256': certificate_sha256})
           output = Path('app/build/ci-provenance')
           output.mkdir(parents=True, exist_ok=True)
           metadata = {
               'commit': os.environ['GITHUB_SHA'],
               'backend': backend,
-              'applicationId': 'top.jast.miracastreceiver',
+              'applicationId': application_id,
+              'compatibilityTestPackage': test_package,
               'abi': 'armeabi-v7a',
               'apks': records,
               'nativeSource': 'https://github.com/weekdayjast/MiracastReceiver/releases/download/v1.2.15/uxplay-native-source-v1.2.15.tar.gz' if native else None,

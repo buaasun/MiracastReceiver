@@ -173,7 +173,7 @@ class PlayerActivity : AppCompatActivity() {
     private var lastCropSampleAt = 0L
     private var cropSession = 0
     private var autoRotateToFit = false
-    /** 镜像旋转用的 TextureView 层：0° 时隐藏，仍走 SurfaceView 保住电视上的性能。 */
+    /** 旋转/裁剪及Miracast兼容输出用TextureView；默认0°仍保留SurfaceView。 */
     private lateinit var mirrorRotateLayer: FrameLayout
     private lateinit var mirrorRotateTexture: TextureView
     private var mirrorHolderSurface: Surface? = null
@@ -1222,8 +1222,15 @@ class PlayerActivity : AppCompatActivity() {
         if (!isCurrentImage() || isMirrorSession()) resetImageRotation()
     }
 
+    private fun mirrorSource(): MirrorSurfaceSource? = when {
+        isAirPlayMirrorSession -> MirrorSurfaceSource.AIRPLAY
+        isMiracastSession -> MirrorSurfaceSource.MIRACAST
+        else -> null
+    }
+
     private fun applyMirrorRotation() {
-        val needsTexture = rotationDegrees != 0 || activeMirrorCrop().width() < 0.99f
+        val needsTexture = mirrorNeedsTexture(mirrorSource(), rotationDegrees, activeMirrorCrop().width(),
+            top.jast.miracastreceiver.util.AppSettings.isMiracastCompatibilityMode(this))
         setMirrorRotateLayerVisible(needsTexture)
         if (needsTexture) {
             setTextureRotation(mirrorRotateTexture, StreamStats.videoWidth, StreamStats.videoHeight)
@@ -1236,23 +1243,15 @@ class PlayerActivity : AppCompatActivity() {
         updateMirrorSurfaceTarget()
     }
 
-    /**
-     * 选出解码器该往哪块 Surface 送帧：旋转时用 TextureView（可以做变换），
-     * 0° 时用 SurfaceView（走硬件视频层，电视上 4K 也不卡）。解码器检测到 Surface
-     * 变化会原地切换输出（见 VideoDecoder.switchOutputSurface）。
-     */
+    /** 默认0°保留硬件视频层；Miracast兼容模式即使不旋转也走TextureView。 */
     private fun updateMirrorSurfaceTarget() {
         if (surfacePublisherStopped || isFinishing) return
-        // TextureView 第一次显示时 SurfaceTexture 要等一帧绘制才就绪。这段时间继续用 SurfaceView，
-        // 千万不能发布 null：解码器会当成 Surface 丢失而重建，重建后要等 iPhone 的下一个关键帧，
-        // 静止画面下可能一直黑屏。就绪后再原地切过去。
-        val useTexture = isMirrorSession() && (rotationDegrees != 0 || activeMirrorCrop().width() < 0.99f) && mirrorTextureSurface != null
-        val source = when {
-            isAirPlayMirrorSession -> MirrorSurfaceSource.AIRPLAY
-            isMiracastSession -> MirrorSurfaceSource.MIRACAST
-            else -> null
-        }
-        val target = if (source == null) null else if (useTexture) mirrorTextureSurface else mirrorHolderSurface
+        // Texture尚未就绪时继续使用现有Surface，不能发布过渡null迫使解码器重建。
+        val source = mirrorSource()
+        val target = mirrorOutputSurface(source, mirrorHolderSurface, mirrorTextureSurface,
+            rotationDegrees, activeMirrorCrop().width(),
+            top.jast.miracastreceiver.util.AppSettings.isMiracastCompatibilityMode(this))
+        val useTexture = target != null && target === mirrorTextureSurface
         if (target !== mirrorSurface) {
             Timber.i("Mirror render target -> ${if (useTexture) "TextureView" else "SurfaceView"} (${if (target == null) "not ready" else "ready"})")
         }

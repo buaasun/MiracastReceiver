@@ -3,6 +3,7 @@ package top.jast.miracastreceiver.miracast
 import android.content.Context
 import android.content.Intent
 import timber.log.Timber
+import top.jast.miracastreceiver.util.AppSettings
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.Socket
@@ -32,8 +33,12 @@ class WfdSessionHandler(
     private val context: Context,
     private val socket: Socket,
     private val rtpPort: Int,
+    compatibilityModeProvider: () -> Boolean = { AppSettings.isMiracastCompatibilityMode(context) },
     private val customModeProvider: (Boolean) -> WfdCustomVideoMode? = { wfdCustomVideoMode(context, it) }
 ) {
+    // 每会话只读取一次，防止设置变化让 M3 声明与 M4 校验不一致。
+    private val compatibilityMode = compatibilityModeProvider()
+    private var compatibilityVideoSelected = false
     private val input: InputStream = socket.getInputStream()
     private val output: OutputStream = socket.getOutputStream()
 
@@ -132,6 +137,22 @@ class WfdSessionHandler(
                 else sendOk(cseq)                                 // keep-alive
             }
             "SET_PARAMETER" -> {
+                if (compatibilityMode) {
+                    val legacy = param(msg, "wfd_video_formats")
+                    val extended = param(msg, "wfdx_video_formats")
+                    val custom = param(msg, "microsoft_custom_video_formats")
+                    val unsupported = (legacy != null && !matchesWfdCompatibilityMode(legacy)) ||
+                        (extended != null && extended != "none") || (custom != null && custom != "none")
+                    if (unsupported || (msg.contains("wfd_trigger_method: SETUP") &&
+                            !compatibilityVideoSelected && legacy == null)) {
+                        Timber.w("WFD: incompatible or unadvertised video selection")
+                        send("RTSP/1.0 400 Bad Request\r\nCSeq: $cseq\r\nContent-Length: 0\r\n\r\n")
+                        // 拒绝后关闭会话，不能让后续 M5 或 SETUP 响应继续进入 PLAY。
+                        close()
+                        return
+                    }
+                    if (legacy != null) compatibilityVideoSelected = true
+                }
                 // M4 里的 presentation URL 有两个值（"<url> none"），只能取第一个，
                 // 否则拼出的 SETUP 请求行会多一段，Source 判定畸形直接断链。
                 param(msg, "wfd_presentation_URL")
@@ -181,6 +202,7 @@ class WfdSessionHandler(
 
     // ─── 处理 Source 对我们请求的响应 ────────────────────────────────────────
     private fun handleResponse(msg: String) {
+        if (compatibilityMode && !compatibilityVideoSelected) return
         val session = header(msg, "Session")?.substringBefore(';')
         if (!session.isNullOrBlank() && sessionId.isEmpty()) {
             sessionId = session
@@ -232,14 +254,15 @@ class WfdSessionHandler(
      * 标准模式始终保留；仅在 Source 查询扩展时声明硬件支持的自定义分辨率。
      */
     private fun sendCapabilities(cseq: String, requested: Set<String>) {
-        val mode = if ("microsoft_custom_video_formats" in requested || "wfdx_video_formats" in requested)
+        val mode = if (!compatibilityMode &&
+            ("microsoft_custom_video_formats" in requested || "wfdx_video_formats" in requested))
             customModeProvider("wfdx_video_formats" in requested) else null
         if ("microsoft_custom_video_formats" in requested) advertisedCustomMode = mode?.takeIf {
             "wfdx_video_formats" in requested || it.levelBit <= 0x10
         }
         if (mode != null) Timber.i("WFD: custom receive declaration = %dx%d p%d", mode.width, mode.height, mode.fps)
         val body = buildString {
-            wfdVideoCapabilityLines(requested, mode).forEach { append(it).append("\r\n") }
+            wfdVideoCapabilityLines(requested, mode, compatibilityMode).forEach { append(it).append("\r\n") }
             append("wfd_audio_codecs: $AUDIO_CODECS\r\n")
             // 关键：告诉 Source 往哪个 UDP 端口发 RTP，缺了这项收不到画面
             append("wfd_client_rtp_ports: RTP/AVP/UDP;unicast $rtpPort 0 mode=play\r\n")
