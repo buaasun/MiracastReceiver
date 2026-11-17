@@ -1246,11 +1246,14 @@ class PlayerActivity : AppCompatActivity() {
     /** 默认0°保留硬件视频层；Miracast兼容模式即使不旋转也走TextureView。 */
     private fun updateMirrorSurfaceTarget() {
         if (surfacePublisherStopped || isFinishing) return
-        // Texture尚未就绪时继续使用现有Surface，不能发布过渡null迫使解码器重建。
         val source = mirrorSource()
+        // 只延续本Activity、同协议且仍存活的输出，初次兼容会话不先绑定SurfaceView。
+        val published = source?.let { mirrorSurfaces.surfaceFor(it) }?.takeIf {
+            it.isValid && (it === mirrorHolderSurface || it === mirrorTextureSurface)
+        }
         val target = mirrorOutputSurface(source, mirrorHolderSurface, mirrorTextureSurface,
             rotationDegrees, activeMirrorCrop().width(),
-            top.jast.miracastreceiver.util.AppSettings.isMiracastCompatibilityMode(this))
+            top.jast.miracastreceiver.util.AppSettings.isMiracastCompatibilityMode(this), published)
         val useTexture = target != null && target === mirrorTextureSurface
         if (target !== mirrorSurface) {
             Timber.i("Mirror render target -> ${if (useTexture) "TextureView" else "SurfaceView"} (${if (target == null) "not ready" else "ready"})")

@@ -21,8 +21,8 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = if (compatibilityTestPackage) "top.jast.miracastreceiver.compat" else "top.jast.miracastreceiver"
-        manifestPlaceholders["receiverLabel"] = if (compatibilityTestPackage) "Miracast 兼容测试" else "@string/app_name"
+        applicationId = if (compatibilityTestPackage) "top.jast.miracastreceiver.compat2" else "top.jast.miracastreceiver"
+        manifestPlaceholders["receiverLabel"] = if (compatibilityTestPackage) "Miracast 兼容测试2" else "@string/app_name"
         minSdk = 21
         targetSdk = 36
         versionCode = 23

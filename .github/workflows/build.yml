@@ -75,7 +75,7 @@ jobs:
           backend = os.environ['AIRPLAY_BACKEND']
           native = backend == 'uxplay'
           test_package = os.environ.get('COMPAT_TEST_PACKAGE') == 'true'
-          application_id = 'top.jast.miracastreceiver' + ('.compat' if test_package else '')
+          application_id = 'top.jast.miracastreceiver' + ('.compat2' if test_package else '')
           build_tools = Path(os.environ['ANDROID_HOME']) / 'build-tools/35.0.0'
           aapt = build_tools / 'aapt'
           apks = sorted(Path('app/build/outputs/apk').glob('*/*.apk'))
