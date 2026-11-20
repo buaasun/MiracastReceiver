@@ -25,8 +25,8 @@ android {
         manifestPlaceholders["receiverLabel"] = if (compatibilityTestPackage) "Miracast 兼容测试2" else "@string/app_name"
         minSdk = 21
         targetSdk = 36
-        versionCode = 23
-        versionName = "1.2.15"
+        versionCode = 25
+        versionName = "1.2.16"
         buildConfigField("boolean", "USE_UXPLAY", useUxPlay.toString())
         if (useUxPlay) minSdk = 23
 

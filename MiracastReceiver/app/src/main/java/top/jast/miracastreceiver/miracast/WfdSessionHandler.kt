@@ -8,6 +8,7 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.net.Socket
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Wi-Fi Display RTSP 会话处理器（Sink 侧）。
@@ -42,10 +43,14 @@ class WfdSessionHandler(
     private val input: InputStream = socket.getInputStream()
     private val output: OutputStream = socket.getOutputStream()
 
-    private var outCseq = 0                  // 我们主动发起的请求用的 CSeq
-    private var sessionId = ""
+    private val outCseq = AtomicInteger()
+    @Volatile private var sessionId = ""
     private var presentationUrl = ""
     private var playRequested = false
+    @Volatile private var playing = false
+    private var lastIdrRequestMs = -1_000L
+    @Volatile private var idrRequestCseq = -1
+    @Volatile private var idrUnsupported = false
     private var advertisedCustomMode: WfdCustomVideoMode? = null
 
     var onSessionEstablished: ((sessionId: String) -> Unit)? = null
@@ -111,7 +116,7 @@ class WfdSessionHandler(
         return msg
     }
 
-    private fun send(msg: String) {
+    @Synchronized private fun send(msg: String) {
         Timber.d("WFD << ${msg.lineSequence().first()}")
         Timber.v("WFD << full:\n$msg")
         output.write(msg.toByteArray(StandardCharsets.UTF_8))
@@ -203,6 +208,12 @@ class WfdSessionHandler(
     // ─── 处理 Source 对我们请求的响应 ────────────────────────────────────────
     private fun handleResponse(msg: String) {
         if (compatibilityMode && !compatibilityVideoSelected) return
+        if (header(msg, "CSeq")?.toIntOrNull() == idrRequestCseq) {
+            val status = msg.substringBefore("\r\n").split(' ').getOrNull(1)?.toIntOrNull() ?: 0
+            Timber.i("WFD: keyframe request response = %d", status)
+            if (status >= 400) idrUnsupported = true
+            return
+        }
         val session = header(msg, "Session")?.substringBefore(';')
         if (!session.isNullOrBlank() && sessionId.isEmpty()) {
             sessionId = session
@@ -210,6 +221,7 @@ class WfdSessionHandler(
             onSessionEstablished?.invoke(sessionId)
             sendPlay()                                           // M7
         } else if (playRequested) {
+            playing = true
             Timber.i("WFD: PLAY acknowledged, RTP should start on $rtpPort")
             onStreamStart?.invoke(rtpPort)
             startPlayerActivity()
@@ -220,7 +232,7 @@ class WfdSessionHandler(
     // ─── 我们主动发起的请求 ──────────────────────────────────────────────────
     private fun sendOptions() = send(
         "OPTIONS * RTSP/1.0\r\n" +
-            "CSeq: ${++outCseq}\r\n" +
+            "CSeq: ${outCseq.incrementAndGet()}\r\n" +
             "Require: org.wfa.wfd1.0\r\n\r\n"
     )
 
@@ -230,7 +242,7 @@ class WfdSessionHandler(
         }
         send(
             "SETUP $presentationUrl RTSP/1.0\r\n" +
-                "CSeq: ${++outCseq}\r\n" +
+                "CSeq: ${outCseq.incrementAndGet()}\r\n" +
                 "Transport: RTP/AVP/UDP;unicast;client_port=$rtpPort\r\n\r\n"
         )
     }
@@ -239,7 +251,7 @@ class WfdSessionHandler(
         playRequested = true
         send(
             "PLAY $presentationUrl RTSP/1.0\r\n" +
-                "CSeq: ${++outCseq}\r\n" +
+                "CSeq: ${outCseq.incrementAndGet()}\r\n" +
                 "Session: $sessionId\r\n\r\n"
         )
     }
@@ -301,6 +313,7 @@ class WfdSessionHandler(
     }
 
     fun close() {
+        playing = false
         try {
             socket.close()
         } catch (e: Exception) {
@@ -311,10 +324,24 @@ class WfdSessionHandler(
     fun disconnectSender() {
         try {
             if (sessionId.isNotEmpty()) send(
-                "TEARDOWN $presentationUrl RTSP/1.0\r\nCSeq: ${++outCseq}\r\nSession: $sessionId\r\n\r\n"
+                "TEARDOWN $presentationUrl RTSP/1.0\r\nCSeq: ${outCseq.incrementAndGet()}\r\nSession: $sessionId\r\n\r\n"
             )
         } finally {
             close()
         }
+    }
+
+    /** WFD M13, matching AOSP WifiDisplaySink::sendIDRFrameRequest. Runs off the demux thread. */
+    @Synchronized fun requestKeyFrame() {
+        if (!playing || socket.isClosed || sessionId.isEmpty() || idrUnsupported) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastIdrRequestMs < 1_000) return
+        lastIdrRequestMs = now
+        idrRequestCseq = outCseq.incrementAndGet()
+        val body = "wfd_idr_request\r\n"
+        send("SET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\n" +
+            "CSeq: $idrRequestCseq\r\nSession: $sessionId\r\n" +
+            "Content-Type: text/parameters\r\nContent-Length: ${body.toByteArray(StandardCharsets.UTF_8).size}\r\n\r\n$body")
+        Timber.i("WFD: requested fresh video keyframe")
     }
 }
